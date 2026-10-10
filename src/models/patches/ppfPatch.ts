@@ -91,7 +91,7 @@ export default class PPFPatch extends Patch {
     outputRomPath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await this.getFile().extractToTempIOFile('r', async (patchFile) => {
+    await this.getFile().extractToIOFile(async (patchFile) => {
       const header = await PPFHeader.fromIOFile(inputRomFile, patchFile);
 
       await PPFPatch.writeOutputFile(inputRomFile, outputRomPath, patchFile, header, callback);
@@ -112,10 +112,9 @@ export default class PPFPatch extends Patch {
       while (!patchFile.isEOF()) {
         await this.applyPatchBlock(patchFile, targetFile, header);
 
-        if (callback !== undefined) {
-          const progressPercentage = patchFile.getPosition() / patchFile.getSize();
-          callback(Math.floor(progressPercentage * targetFile.getSize()));
-        }
+        callback?.(
+          Math.floor((patchFile.getPosition() / patchFile.getSize()) * targetFile.getSize()),
+        );
       }
     } finally {
       await targetFile.close();
@@ -133,7 +132,8 @@ export default class PPFPatch extends Patch {
       return;
     }
     if (peek === '@BEGIN_FILE_ID.DIZ') {
-      // TODO(cemmer): handle?
+      // FILE_ID.DIZ is always last; skip it
+      patchFile.seek(patchFile.getSize());
       return;
     }
 

@@ -19,7 +19,7 @@ export default class APSGBAPatch extends Patch {
     const crcBefore = super.getCrcFromPath(file.getExtractedFilePath());
     let targetSize = 0;
 
-    await file.extractToTempIOFile('r', async (patchFile) => {
+    await file.extractToIOFile(async (patchFile) => {
       patchFile.seek(this.FILE_SIGNATURE.length);
       patchFile.skipNext(4); // original file size
       targetSize = (await patchFile.readNext(4)).readUInt32LE();
@@ -36,7 +36,7 @@ export default class APSGBAPatch extends Patch {
     outputRomPath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await this.getFile().extractToTempIOFile('r', async (patchFile) => {
+    await this.getFile().extractToIOFile(async (patchFile) => {
       const header = await patchFile.readNext(APSGBAPatch.FILE_SIGNATURE.length);
       if (!header.equals(APSGBAPatch.FILE_SIGNATURE)) {
         throw new IgirException(`APS (GBA) patch header is invalid: ${this.getFile().toString()}`);
@@ -49,9 +49,15 @@ export default class APSGBAPatch extends Patch {
         );
       }
 
-      patchFile.skipNext(4); // patched size
+      const targetSize = (await patchFile.readNext(4)).readUInt32LE();
 
-      await APSGBAPatch.writeOutputFile(inputRomFile, outputRomPath, patchFile, callback);
+      await APSGBAPatch.writeOutputFile(
+        inputRomFile,
+        outputRomPath,
+        patchFile,
+        targetSize,
+        callback,
+      );
     });
   }
 
@@ -59,19 +65,17 @@ export default class APSGBAPatch extends Patch {
     inputRomFile: File,
     outputRomPath: string,
     patchFile: IOFile,
+    targetSize: number,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await inputRomFile.extractToTempFile(async (tempRomFile) => {
-      const sourceFile = await IOFile.fileFrom(tempRomFile, 'r');
-
-      await FsUtil.copyFile(tempRomFile, outputRomPath);
+    await inputRomFile.extractToFile(outputRomPath);
+    await inputRomFile.extractToIOFile(async (sourceFile) => {
       const targetFile = await IOFile.fileFrom(outputRomPath, 'r+');
-
       try {
         await this.applyPatch(patchFile, sourceFile, targetFile, callback);
+        await targetFile.truncate(targetSize);
       } finally {
         await targetFile.close();
-        await sourceFile.close();
       }
     });
   }
@@ -86,7 +90,7 @@ export default class APSGBAPatch extends Patch {
       const offset = (await patchFile.readNext(4)).readUInt32LE();
       patchFile.skipNext(2); // CRC16 of original 64KiB block
       patchFile.skipNext(2); // CRC16 of patched 64KiB block
-      const xorData = await patchFile.readNext(1024 * 1024);
+      const xorData = await patchFile.readNext(64 * 1024);
 
       const sourceData = await sourceFile.readAt(offset, xorData.length);
       const targetData = Buffer.allocUnsafe(xorData.length);
@@ -95,10 +99,11 @@ export default class APSGBAPatch extends Patch {
       }
       await targetFile.writeAt(targetData, offset);
 
-      if (callback !== undefined) {
-        const progressPercentage = patchFile.getPosition() / patchFile.getSize();
-        callback(Math.floor(progressPercentage * targetFile.getSize()));
+      if (callback === undefined) {
+        continue;
       }
+      const progressPercentage = patchFile.getPosition() / patchFile.getSize();
+      callback(Math.floor(progressPercentage * targetFile.getSize()));
     }
   }
 }

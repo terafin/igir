@@ -8,6 +8,18 @@ Games and their ROMs are protected under copyrights, so patches are used to not 
 
 Patch files can be specified with the `--patch <path|glob>` option. See the [file scanning docs](../input/file-scanning.md) for more information.
 
+## Supported commands
+
+Patching can be used with any combination of the [`copy` or `move` commands](../commands.md#rom-writing), with or without the [`extract` or `zip` commands](../commands.md#rom-extracting-zipping). Patching can't be used with the [`link` command](../commands.md#link).
+
+Patches need to read the ROM's contents, so there are some limitations when ROMs are archived and those archives would be copied or moved as-is:
+
+| Commands                         | Patched un-archived ROMs | Patched archived ROMs                                                                                        |
+|----------------------------------|--------------------------|--------------------------------------------------------------------------------------------------------------|
+| `copy` or `move`                 | ✅                       | ❌ input archives will not be modified in any way                                                            |
+| `copy extract` or `move extract` | ✅                       | ✅                                                                                                           |
+| `copy zip` or `move zip`         | ✅                       | ⚠️ only ROMs that aren't [excluded from zipping](../output/writing-archives.md#excluding-files-from-zipping) |
+
 ## Patch types
 
 There are many, _many_ patch types that ROM hackers use to distribute their changes on the internet ([xkcd "Standards"](https://xkcd.com/927/)). Typically, a patch will only be distributed in one format, so gamers are entirely at the mercy of the ROM hacker's choice.
@@ -18,31 +30,35 @@ Not all patch types are created equal. Here are some tables of some existing for
 
 | Type                 | Supported                        | CRC32 in patch contents | Notes                                                                                                                                                                                                                                                                        |
 |----------------------|----------------------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `.bps`               | ✅                                | ✅                       |                                                                                                                                                                                                                                                                              |
-| `.ips`               | ✅ IPS, IPS32                     | ❌                       |                                                                                                                                                                                                                                                                              |
-| `.ppf`               | ✅ 2.0, 3.0                       | ❌                       |                                                                                                                                                                                                                                                                              |
-| `.ups`               | ✅                                | ✅                       | ⚠️ UPS patches read and write files byte-by-byte, making them horribly slow and inefficient. The author, byuu, created `.ups` to replace `.ips`, but then created `.bps` as a replacement for `.ups`.                                                                        |
-| `.vcdiff`, `.xdelta` | ⚠️ without secondary compression | ❌                       | ⚠️ VCDIFF patches read and write files byte-by-byte during `COPY` instructions, usually making them slow and inefficient.<br>⚠️ [xdelta3](https://github.com/jmacd/xdelta) makes use of LZMA secondary compression by default, so many patches are likely to be unsupported. |
+| `.bps`               | ✅                               | ✅                      |                                                                                                                                                                                                                                                                              |
+| `.ips`               | ✅ IPS, IPS32                    | ❌                      |                                                                                                                                                                                                                                                                              |
+| `.ppf`               | ✅ v2, v3                        | ❌                      |                                                                                                                                                                                                                                                                              |
+| `.ups`               | ✅                               | ✅                      | ⚠️ UPS patches read and write files byte-by-byte, making them horribly slow and inefficient. The author, byuu, created `.ups` to replace `.ips`, but then created `.bps` as a replacement for `.ups`.                                                                        |
+| `.vcdiff`, `.xdelta` | ⚠️ without secondary compression | ❌                      | ⚠️ VCDIFF patches read and write files byte-by-byte during `COPY` instructions, usually making them slow and inefficient.<br>⚠️ [xdelta3](https://github.com/jmacd/xdelta) makes use of LZMA secondary compression by default, so many patches are likely to be unsupported. |
 
 **Uncommon patch types:**
 
-| Type                            | Supported                                              | CRC32 in patch contents | Notes                                                                                                              |
-|---------------------------------|--------------------------------------------------------|-------------------------|--------------------------------------------------------------------------------------------------------------------|
-| `.aps` (GBA)                    | ✅                                                      | ❌                       |                                                                                                                    |
-| `.aps` (N64)                    | ✅ simple & N64                                         | ❌                       |                                                                                                                    |
-| `.bdf` (BSDiff)                 | ❌                                                      | ❓                       |                                                                                                                    |
-| `.bsp` (Binary Script Patching) | ❌                                                      | ❌                       | BSP will probably never be supported, the implementation is [non-trivial](https://github.com/aaaaaa123456789/bsp). |
-| `.dldi` (NDS libfat)            | ❌                                                      | ❌                       | No file specification exists.                                                                                      |
-| `.dps` (Deufeufeu)              | ✅                                                      | ❌                       |                                                                                                                    |
-| `.ebp` (EarthBound)             | ✅                                                      | ❌                       | EBP is just IPS with some JSON after the `EOF` string.                                                             |
-| `.gdiff`                        | ❌                                                      | ❓                       |                                                                                                                    |
-| `.mod` (Star Rod)               | ❌                                                      | ❓                       | No file specification exists anymore.                                                                              |
-| `.ffp`, `.pat` (FireFlower)     | ❌                                                      | ❓                       | No file specification exists anymore.                                                                              |
-| `.pds` (Sephiroth87's NDS)      | ❌                                                      | ❓                       | No file specification exists.                                                                                      |
-| `.rup` (NINJA 2.0)              | ⚠️ only single file patches, only raw/binary file type | ❌ uses MD5              |                                                                                                                    |
-| `.rxl` (ROM eXtension Library)  | ❌                                                      | ❌                       | RXL will probably never be supported, it is used to inject files at manually specified locations into ROMs.        |
+| Type                            | Supported                                              | CRC32 in patch contents | Notes                                                                                                                    |
+|---------------------------------|--------------------------------------------------------|-------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| `.aps` (GBA)                    | ✅                                                     | ❌                      |                                                                                                                          |
+| `.aps` (N64)                    | ✅ simple & N64                                        | ❌                      |                                                                                                                          |
+| `.bdf`, `.bsdiff` (BSDiff)      | ✅ v4                                                  | ❌                      |                                                                                                                          |
+| `.bsp` (Binary Script Patching) | ❌                                                     | ❌                      | BSP will probably never be supported, the implementation is [non-trivial](https://github.com/aaaaaa123456789/bsp).       |
+| `.dldi` (NDS libfat)            | ❌                                                     | ❌                      | No file specification exists.                                                                                            |
+| `.dps` (Deufeufeu)              | ✅                                                     | ❌                      |                                                                                                                          |
+| `.ebp` (EarthBound)             | ✅                                                     | ❌                      | EBP is just IPS with some JSON after the `EOF` string.                                                                   |
+| `.gdiff`                        | ❌                                                     | ❓                      |                                                                                                                          |
+| `.mod` (Paper Mario Star Rod)   | ✅ PMSR, Yay0-compressed PMSR                          | ❌                      | The source file has to be `Paper Mario (USA).z64` (CRC32 `A7F5CD7E`), so you don't need to put it in the patch filename. |
+| `.ffp`, `.pat` (FireFlower)     | ❌                                                     | ❓                      | No file specification exists anymore.                                                                                    |
+| `.pds` (Sephiroth87's NDS)      | ❌                                                     | ❓                      | No file specification exists.                                                                                            |
+| `.rup` (NINJA 2.0)              | ⚠️ only single file patches, only raw/binary file type | ❌ uses MD5             |                                                                                                                          |
+| `.rxl` (ROM eXtension Library)  | ❌                                                     | ❌                      | RXL will probably never be supported, it is used to inject files at manually specified locations into ROMs.              |
 
 If you have a choice in patch format, choose one that contains CRC32 checksums in the patch file contents (e.g. choose `.bps` over `.ips` if possible).
+
+!!! note
+
+    Igir can read patch files inside any supported [archive format](../input/reading-archives.md) (just like DATs and ROMs), but most patch types will have to be fully extracted to a [temporary file](https://igir.io/advanced/temp-dir/) before they can be applied.
 
 ## ROM checksums
 

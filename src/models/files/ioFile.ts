@@ -9,19 +9,12 @@ import FsUtil from '../../utils/fsUtil.js';
  */
 export default class IOFile {
   private readonly pathLike: PathLike;
-
   private readonly fileHandle: fs.promises.FileHandle;
-
   private readonly fileMode: fs.Mode;
 
-  private readonly size: number;
-
-  private tempBuffer?: Buffer;
-
+  private size: number;
   private readPosition = 0;
-
   private fileBuffer?: Buffer;
-
   private wroteToMemory = false;
 
   private constructor(
@@ -71,15 +64,24 @@ export default class IOFile {
     }
 
     const write = await this.fileFrom(pathLike, 'wx+', size);
-    let written = 0;
-    const buffer = Buffer.alloc(Defaults.FILE_READING_CHUNK_SIZE);
-    while (written < size) {
-      const sizeToWrite = Math.min(size - written, buffer.length);
-      written += await write.write(buffer.subarray(0, sizeToWrite));
-    }
-    await write.close();
+    try {
+      try {
+        let written = 0;
+        const buffer = Buffer.alloc(Defaults.FILE_READING_CHUNK_SIZE);
+        while (written < size) {
+          const sizeToWrite = Math.min(size - written, buffer.length);
+          written += await write.write(buffer.subarray(0, sizeToWrite));
+        }
+      } finally {
+        await write.close();
+      }
 
-    return await this.fileFrom(pathLike, flags);
+      return await this.fileFrom(pathLike, flags);
+    } catch (error) {
+      // Don't leave a partially written file behind
+      await FsUtil.rm(pathLike, { force: true });
+      throw error;
+    }
   }
 
   getPathLike(): PathLike {
@@ -133,6 +135,11 @@ export default class IOFile {
     return result;
   }
 
+  private async loadFileBuffer(): Promise<Buffer> {
+    this.fileBuffer ??= await this.fileHandle.readFile();
+    return this.fileBuffer;
+  }
+
   /**
    * @returns bytes of size {@link size} at the seek position {@link offset}
    */
@@ -140,27 +147,27 @@ export default class IOFile {
     // If the file is small, read the entire file to memory and "read" from there
     if (this.fileBuffer !== undefined || this.size <= Defaults.MAX_MEMORY_FILE_SIZE) {
       // Read into the file buffer (if we haven't already)
-      this.fileBuffer ??= await this.fileHandle.readFile();
+      const fileBuffer = await this.loadFileBuffer();
 
-      // Read from the file buffer
-      return Buffer.from(this.fileBuffer.subarray(position, position + size));
+      // Read from the file buffer, which may have been allocated past the end of the file
+      return Buffer.from(
+        fileBuffer.subarray(position, Math.max(position, Math.min(position + size, this.size))),
+      );
     }
 
-    if (this.tempBuffer === undefined || size > this.tempBuffer.length) {
-      this.tempBuffer = Buffer.allocUnsafe(Math.max(size, Defaults.FILE_READING_CHUNK_SIZE));
-    }
-
-    // If the file is large, read from the open file handle
+    // If the file is large, read from the open file handle. Each read gets its own buffer so
+    // concurrent reads can't overwrite each other's bytes
+    const buffer = Buffer.allocUnsafe(size);
     let bytesRead: number;
     try {
-      bytesRead = (await this.fileHandle.read(this.tempBuffer, 0, size, position)).bytesRead;
+      bytesRead = (await this.fileHandle.read(buffer, 0, size, position)).bytesRead;
     } catch {
       // NOTE(cemmer): Windows will give "EINVAL: invalid argument, read" when reading out of
       //  bounds, but other OSes don't. Swallow the error.
       return Buffer.allocUnsafe(0);
     }
 
-    return Buffer.from(this.tempBuffer.subarray(0, bytesRead));
+    return buffer.subarray(0, bytesRead);
   }
 
   /**
@@ -182,7 +189,7 @@ export default class IOFile {
       /w|a|r\+/.test(this.fileMode.toString())
     ) {
       // Read into the file buffer (if we haven't already)
-      this.fileBuffer ??= await this.fileHandle.readFile();
+      this.fileBuffer = await this.loadFileBuffer();
 
       // Expand the file buffer if we're writing past its size
       if (position + buffer.length > this.fileBuffer.length) {
@@ -202,6 +209,7 @@ export default class IOFile {
 
       // Write to the file buffer
       const bytesWritten = buffer.copy(this.fileBuffer, position);
+      this.size = Math.max(this.size, position + bytesWritten);
       this.wroteToMemory = true;
 
       // Yield to the event loop so progress bars can redraw
@@ -213,18 +221,41 @@ export default class IOFile {
     }
 
     const { bytesWritten } = await this.fileHandle.write(buffer, 0, buffer.length, position);
+    this.size = Math.max(this.size, position + bytesWritten);
     return bytesWritten;
+  }
+
+  /**
+   * Truncate or zero-extend the file to {@link size} bytes.
+   */
+  async truncate(size: number): Promise<void> {
+    if (this.fileBuffer !== undefined) {
+      if (size > this.fileBuffer.length) {
+        this.fileBuffer = Buffer.concat([
+          this.fileBuffer,
+          Buffer.alloc(size - this.fileBuffer.length),
+        ]);
+      } else {
+        // Drop the bytes past the new end, so growing the file later can't expose them
+        this.fileBuffer = this.fileBuffer.subarray(0, size);
+      }
+    }
+    await this.fileHandle.truncate(size);
+    this.size = size;
   }
 
   /**
    * Close the underlying file handle
    */
   async close(): Promise<void> {
-    if (this.fileBuffer !== undefined && this.wroteToMemory) {
-      // We staged writes in memory, we need to rewrite the entire file
-      await this.fileHandle.write(this.fileBuffer, 0, this.fileBuffer.length, 0);
+    try {
+      if (this.fileBuffer !== undefined && this.wroteToMemory) {
+        // We staged writes in memory, we need to rewrite the entire file
+        await this.fileHandle.write(this.fileBuffer, 0, this.size, 0);
+      }
+    } finally {
+      // Close the handle even if flushing the staged writes failed
+      await this.fileHandle.close();
     }
-
-    await this.fileHandle.close();
   }
 }

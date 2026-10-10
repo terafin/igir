@@ -36,7 +36,7 @@ export default class APSN64Patch extends Patch {
     const crcBefore = super.getCrcFromPath(file.getExtractedFilePath());
     let targetSize = 0;
 
-    await file.extractToTempIOFile('r', async (patchFile) => {
+    await file.extractToIOFile(async (patchFile) => {
       patchFile.seek(this.FILE_SIGNATURE.length);
       patchType = (await patchFile.readNext(1)).readUInt8() as APSN64PatchTypeValue;
       patchFile.skipNext(1); // encoding method
@@ -69,23 +69,23 @@ export default class APSN64Patch extends Patch {
     outputRomPath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await this.getFile().extractToTempIOFile('r', async (patchFile) => {
+    await this.getFile().extractToIOFile(async (patchFile) => {
       const header = await patchFile.readNext(APSN64Patch.FILE_SIGNATURE.length);
       if (!header.equals(APSN64Patch.FILE_SIGNATURE)) {
         throw new IgirException(`APS (N64) patch header is invalid: ${this.getFile().toString()}`);
       }
 
-      if (this.patchType === APSN64PatchType.SIMPLE) {
-        patchFile.seek(61);
-      } else if (this.patchType === APSN64PatchType.N64) {
-        patchFile.seek(78);
-      } else {
-        throw new IgirException(
-          `APS (N64) patch type ${this.patchType} isn't supported: ${patchFile.getPathLike().toString()}`,
-        );
-      }
+      // patchFrom() already rejected unsupported patch types
+      patchFile.seek(this.patchType === APSN64PatchType.SIMPLE ? 57 : 74);
+      const targetSize = (await patchFile.readNext(4)).readUInt32LE();
 
-      await APSN64Patch.writeOutputFile(inputRomFile, outputRomPath, patchFile, callback);
+      await APSN64Patch.writeOutputFile(
+        inputRomFile,
+        outputRomPath,
+        patchFile,
+        targetSize,
+        callback,
+      );
     });
   }
 
@@ -93,6 +93,7 @@ export default class APSN64Patch extends Patch {
     inputRomFile: File,
     outputRomPath: string,
     patchFile: IOFile,
+    targetSize: number,
     callback?: FsReadCallback,
   ): Promise<void> {
     await inputRomFile.extractToFile(outputRomPath);
@@ -100,6 +101,7 @@ export default class APSN64Patch extends Patch {
 
     try {
       await this.applyPatch(patchFile, targetFile, callback);
+      await targetFile.truncate(targetSize);
     } finally {
       await targetFile.close();
     }
@@ -127,10 +129,9 @@ export default class APSN64Patch extends Patch {
 
       await targetFile.writeAt(data, offset);
 
-      if (callback !== undefined) {
-        const progressPercentage = patchFile.getPosition() / patchFile.getSize();
-        callback(Math.floor(progressPercentage * targetFile.getSize()));
-      }
+      callback?.(
+        Math.floor((patchFile.getPosition() / patchFile.getSize()) * targetFile.getSize()),
+      );
     }
   }
 }

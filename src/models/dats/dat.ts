@@ -1,24 +1,25 @@
 import xml2js from 'xml2js';
 
 import FsUtil from '../../utils/fsUtil.js';
+import type File from '../files/file.js';
 import { ChecksumBitmask } from '../files/fileChecksums.js';
 import type Game from './game.js';
 import type Header from './logiqx/header.js';
 import Parent from './parent.js';
 
 export interface DATProps {
-  filePath?: string;
+  file?: File;
 }
 
 /**
  * The base class for other DAT classes.
  */
 export default abstract class DAT {
-  readonly filePath?: string;
+  readonly file?: File;
   private parents: Parent[] = [];
 
   protected constructor(props?: DATProps) {
-    this.filePath = props?.filePath;
+    this.file = props?.file;
   }
 
   abstract getHeader(): Header;
@@ -92,14 +93,16 @@ export default abstract class DAT {
       }
 
       const cloneOf = game.getCloneOf();
-      if (cloneOf !== undefined) {
-        const parent = gameNamesToParents.get(cloneOf);
-        if (parent) {
-          parent.addChild(game);
-        } else {
-          // The DAT is bad, the game is referencing a parent that doesn't exist
-          gameNamesToParents.set(cloneOf, new Parent(game));
-        }
+      if (cloneOf === undefined) {
+        continue;
+      }
+
+      const parent = gameNamesToParents.get(cloneOf);
+      if (parent) {
+        parent.addChild(game);
+      } else {
+        // The DAT is bad, the game is referencing a parent that doesn't exist
+        gameNamesToParents.set(cloneOf, new Parent(game));
       }
     }
 
@@ -108,8 +111,8 @@ export default abstract class DAT {
     return this;
   }
 
-  getFilePath(): string | undefined {
-    return this.filePath;
+  getFile(): File | undefined {
+    return this.file;
   }
 
   getParents(): Parent[] {
@@ -141,6 +144,14 @@ export default abstract class DAT {
 
   getDescription(): string | undefined {
     return this.getHeader().getDescription();
+  }
+
+  getVersion(): string | undefined {
+    return this.getHeader().getVersion();
+  }
+
+  getDate(): string | undefined {
+    return this.getHeader().getDate();
   }
 
   /**

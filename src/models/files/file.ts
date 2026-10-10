@@ -11,6 +11,7 @@ import Defaults from '../../globals/defaults.js';
 import Temp from '../../globals/temp.js';
 import IOFile from '../../models/files/ioFile.js';
 import FsReadTransform, { FsReadCallback } from '../../streams/fsReadTransform.js';
+import PadEndTransform from '../../streams/padEndTransform.js';
 import FsUtil from '../../utils/fsUtil.js';
 import StreamUtil from '../../utils/streamUtil.js';
 import URLUtil from '../../utils/urlUtil.js';
@@ -327,9 +328,8 @@ export default class File implements FileProps {
     if (!(await FsUtil.exists(tempDir))) {
       await FsUtil.mkdir(tempDir, { recursive: true });
     }
-    await this.extractToFile(tempFile);
-
     try {
+      await this.extractToFile(tempFile);
       return await callback(tempFile);
     } finally {
       await FsUtil.rm(tempFile, { force: true });
@@ -337,21 +337,27 @@ export default class File implements FileProps {
   }
 
   /**
-   * Copy this file to a temporary path, open it as an {@link IOFile} with the given flags,
-   * invoke the callback with the open handle, then close and clean up.
+   * Open this file read-only as an {@link IOFile}, invoke the callback with it, then close it.
+   * Files that can't be read in place are first extracted to a temporary path.
    */
-  async extractToTempIOFile<T>(
-    flags: fs.OpenMode,
+  async extractToIOFile<T>(callback: (ioFile: IOFile) => T | Promise<T>): Promise<T> {
+    return await File.readWithIOFile(this.getFilePath(), callback);
+  }
+
+  /**
+   * Open {@link filePath} read-only as an {@link IOFile}, invoke the callback with it, then close
+   * it.
+   */
+  protected static async readWithIOFile<T>(
+    filePath: string,
     callback: (ioFile: IOFile) => T | Promise<T>,
   ): Promise<T> {
-    return await this.extractToTempFile(async (tempFile) => {
-      const ioFile = await IOFile.fileFrom(tempFile, flags);
-      try {
-        return await callback(ioFile);
-      } finally {
-        await ioFile.close();
-      }
-    });
+    const ioFile = await IOFile.fileFrom(filePath, 'r');
+    try {
+      return await callback(ioFile);
+    } finally {
+      await ioFile.close();
+    }
   }
 
   /**
@@ -396,8 +402,8 @@ export default class File implements FileProps {
       const tempFile = await FsUtil.mktemp(
         path.join(Temp.getTempDir(), path.basename(this.getExtractedFilePath())),
       );
-      await patch.createPatchedFile(this, tempFile, callback);
       try {
+        await patch.createPatchedFile(this, tempFile, callback);
         await File.createStreamFromFile(
           tempFile,
           async (readable) => {
@@ -458,12 +464,11 @@ export default class File implements FileProps {
         ? callback
         : async (readable: stream.Readable): Promise<T> => {
             const padding = paddings[0];
-            const padded = StreamUtil.padEnd(
+            return await StreamUtil.pipelineSafe(
               readable,
-              padding.getPaddedSize(),
-              padding.getFillByte(),
+              new PadEndTransform(padding.getPaddedSize(), padding.getFillByte()),
+              callback,
             );
-            return await callback(padded);
           };
 
     // Simple case: create a read stream at an offset
@@ -544,13 +549,21 @@ export default class File implements FileProps {
             return;
           }
 
-          const writeStream = fs.createWriteStream(filePath);
-          res.pipe(writeStream);
-          writeStream.on('error', reject);
-          writeStream.on('finish', async () => {
-            writeStream.close();
-            resolve(await File.fileOf({ filePath }, this.getChecksumBitmask()));
-          });
+          if (res.statusCode === undefined || res.statusCode < 200 || res.statusCode >= 300) {
+            reject(
+              new IgirException(
+                `HTTP ${res.statusCode ?? '?'}${res.statusMessage === undefined || res.statusMessage === '' ? '' : ` ${res.statusMessage}`}`,
+              ),
+            );
+            res.destroy();
+            return;
+          }
+
+          stream.promises
+            .pipeline(res, fs.createWriteStream(filePath))
+            .then(async () => await File.fileOf({ filePath }, this.getChecksumBitmask()))
+            .then(resolve)
+            .catch(reject);
         },
       );
       req.on('error', reject).on('timeout', () => {

@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 
 import Defaults from '../../../src/globals/defaults.js';
@@ -38,6 +39,20 @@ describe('fileOfSize', () => {
       await expect(FsUtil.size(tempFile)).resolves.toEqual(size);
     } finally {
       await FsUtil.rm(tempFile);
+    }
+  });
+
+  it('should close the file handle even if writing fails', async () => {
+    const tempFile = await FsUtil.mktemp(path.join(Temp.getTempDir(), 'file'));
+    vi.spyOn(IOFile.prototype, 'write').mockRejectedValue(new Error('write failed'));
+    const closeSpy = vi.spyOn(IOFile.prototype, 'close');
+
+    try {
+      await expect(IOFile.fileOfSize(tempFile, 'r', 16)).rejects.toThrow('write failed');
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.restoreAllMocks();
+      await FsUtil.rm(tempFile, { force: true });
     }
   });
 });
@@ -173,6 +188,22 @@ describe('readAt', () => {
       await FsUtil.rm(tempFile);
     }
   });
+
+  it('should not read past the end of a memory buffer allocated past the end of the file', async () => {
+    const tempFile = await FsUtil.mktemp(path.join(Temp.getTempDir(), 'file'));
+    try {
+      const ioFile = await IOFile.fileOfSize(tempFile, 'r+', 16);
+      // Writing past the end allocates more of the memory buffer than was written
+      await ioFile.writeAt(Buffer.from('ff', 'hex'), 16);
+      await expect(ioFile.readAt(0, 64)).resolves.toEqual(
+        Buffer.from(`${'00'.repeat(16)}ff`, 'hex'),
+      );
+      await expect(ioFile.readAt(20, 4)).resolves.toEqual(Buffer.alloc(0));
+      await ioFile.close();
+    } finally {
+      await FsUtil.rm(tempFile, { force: true });
+    }
+  });
 });
 
 describe('write', () => {
@@ -219,6 +250,7 @@ describe('write', () => {
       try {
         const file = await IOFile.fileOfSize(tempFile, openMode, 4);
         await file.write(Buffer.from('ABCDEF01'));
+        expect(file.getSize()).toEqual(8);
         await file.close();
 
         const contents = await FsUtil.readFile(tempFile);
@@ -274,6 +306,7 @@ describe('writeAt', () => {
       try {
         const file = await IOFile.fileOfSize(tempFile, openMode, 4);
         await file.writeAt(Buffer.from('ABCDEF01'), 6);
+        expect(file.getSize()).toEqual(14);
         await file.close();
 
         const contents = await FsUtil.readFile(tempFile);
@@ -282,5 +315,152 @@ describe('writeAt', () => {
         await FsUtil.rm(tempFile);
       }
     });
+  });
+
+  it('should grow a file by only the bytes written past its end', async () => {
+    const tempFile = await FsUtil.mktemp(path.join(Temp.getTempDir(), 'file'));
+    try {
+      const ioFile = await IOFile.fileOfSize(tempFile, 'r+', 16);
+      await ioFile.writeAt(Buffer.from('ff', 'hex'), 16);
+      expect(ioFile.getSize()).toEqual(17);
+      await ioFile.close();
+
+      await expect(FsUtil.readFile(tempFile)).resolves.toEqual(
+        Buffer.from(`${'00'.repeat(16)}ff`, 'hex'),
+      );
+    } finally {
+      await FsUtil.rm(tempFile, { force: true });
+    }
+  });
+
+  it('should grow a file too large to buffer in memory', async () => {
+    const tempFile = await FsUtil.mktemp(path.join(Temp.getTempDir(), 'file'));
+    try {
+      await FsUtil.writeFile(tempFile, Buffer.from('00010203', 'hex'));
+      const ioFile = await IOFile.fileFrom(tempFile, 'r+', Defaults.MAX_MEMORY_FILE_SIZE + 1);
+      await ioFile.writeAt(Buffer.from('ff', 'hex'), Defaults.MAX_MEMORY_FILE_SIZE + 1);
+      expect(ioFile.getSize()).toEqual(Defaults.MAX_MEMORY_FILE_SIZE + 2);
+      await ioFile.close();
+
+      await expect(FsUtil.size(tempFile)).resolves.toEqual(Defaults.MAX_MEMORY_FILE_SIZE + 2);
+      const readFile = await IOFile.fileFrom(tempFile, 'r');
+      try {
+        await expect(readFile.readAt(Defaults.MAX_MEMORY_FILE_SIZE - 1, 16)).resolves.toEqual(
+          Buffer.from('0000ff', 'hex'),
+        );
+      } finally {
+        await readFile.close();
+      }
+    } finally {
+      await FsUtil.rm(tempFile, { force: true });
+    }
+  });
+});
+
+describe('truncate', () => {
+  test.each([
+    // [name, initial hex, truncate size, expected hex]
+    ['shrink', '00010203040506070809', 4, '00010203'],
+    ['zero-extend', '00010203', 8, '0001020300000000'],
+  ])('should %s a memory-buffered file', async (_name, initialHex, truncateSize, expectedHex) => {
+    const tempFile = await FsUtil.mktemp(path.join(Temp.getTempDir(), 'file'));
+    try {
+      await FsUtil.writeFile(tempFile, Buffer.from(initialHex, 'hex'));
+      const ioFile = await IOFile.fileFrom(tempFile, 'r+');
+      await ioFile.readAt(0, 1); // load the memory buffer
+      await ioFile.truncate(truncateSize);
+      expect(ioFile.getSize()).toEqual(truncateSize);
+      await expect(ioFile.readAt(0, 1024)).resolves.toEqual(Buffer.from(expectedHex, 'hex'));
+      await ioFile.close();
+
+      await expect(FsUtil.readFile(tempFile)).resolves.toEqual(Buffer.from(expectedHex, 'hex'));
+    } finally {
+      await FsUtil.rm(tempFile, { force: true });
+    }
+  });
+
+  it('should zero the gap when writing past a shrunk end', async () => {
+    const tempFile = await FsUtil.mktemp(path.join(Temp.getTempDir(), 'file'));
+    try {
+      await FsUtil.writeFile(tempFile, Buffer.from('00010203040506070809', 'hex'));
+      const ioFile = await IOFile.fileFrom(tempFile, 'r+');
+      await ioFile.readAt(0, 1); // load the memory buffer
+      await ioFile.truncate(4);
+      await ioFile.writeAt(Buffer.from('ff', 'hex'), 8);
+      await ioFile.close();
+
+      await expect(FsUtil.readFile(tempFile)).resolves.toEqual(
+        Buffer.from('0001020300000000ff', 'hex'),
+      );
+    } finally {
+      await FsUtil.rm(tempFile, { force: true });
+    }
+  });
+
+  it('should zero-extend after a shrink', async () => {
+    const tempFile = await FsUtil.mktemp(path.join(Temp.getTempDir(), 'file'));
+    try {
+      await FsUtil.writeFile(tempFile, Buffer.from('00010203040506070809', 'hex'));
+      const ioFile = await IOFile.fileFrom(tempFile, 'r+');
+      await ioFile.readAt(0, 1); // load the memory buffer
+      await ioFile.truncate(4);
+      await ioFile.truncate(8);
+      await expect(ioFile.readAt(0, 1024)).resolves.toEqual(Buffer.from('0001020300000000', 'hex'));
+      await ioFile.close();
+
+      await expect(FsUtil.readFile(tempFile)).resolves.toEqual(
+        Buffer.from('0001020300000000', 'hex'),
+      );
+    } finally {
+      await FsUtil.rm(tempFile, { force: true });
+    }
+  });
+
+  test.each([
+    // [name, initial hex, truncate size, expected hex]
+    ['shrink', '00010203040506070809', 4, '00010203'],
+    ['zero-extend', '00010203', 8, '0001020300000000'],
+  ])(
+    'should %s a file too large to buffer in memory',
+    async (_name, initialHex, truncateSize, expectedHex) => {
+      const tempFile = await FsUtil.mktemp(path.join(Temp.getTempDir(), 'file'));
+      try {
+        await FsUtil.writeFile(tempFile, Buffer.from(initialHex, 'hex'));
+        const ioFile = await IOFile.fileFrom(tempFile, 'r+', Defaults.MAX_MEMORY_FILE_SIZE + 1);
+        await ioFile.truncate(truncateSize);
+        expect(ioFile.getSize()).toEqual(truncateSize);
+        await ioFile.close();
+
+        await expect(FsUtil.readFile(tempFile)).resolves.toEqual(Buffer.from(expectedHex, 'hex'));
+      } finally {
+        await FsUtil.rm(tempFile, { force: true });
+      }
+    },
+  );
+});
+
+describe('close', () => {
+  it('should close the file handle even if flushing staged writes fails', async () => {
+    const tempFile = await FsUtil.mktemp(path.join(Temp.getTempDir(), 'file'));
+    await FsUtil.writeFile(tempFile, Buffer.alloc(16));
+    const open = fs.promises.open.bind(fs.promises);
+    const openedHandles: fs.promises.FileHandle[] = [];
+    vi.spyOn(fs.promises, 'open').mockImplementation(async (pathLike, flags) => {
+      const handle = await open(pathLike, flags);
+      openedHandles.push(handle);
+      return handle;
+    });
+
+    try {
+      const file = await IOFile.fileFrom(tempFile, 'r+');
+      await file.writeAt(Buffer.from('ABCDEF01'), 0);
+      vi.spyOn(openedHandles[0], 'write').mockRejectedValue(new Error('flush failed'));
+
+      await expect(file.close()).rejects.toThrow('flush failed');
+      expect(openedHandles.map((handle) => handle.fd)).toEqual([-1]);
+    } finally {
+      vi.restoreAllMocks();
+      await FsUtil.rm(tempFile);
+    }
   });
 });

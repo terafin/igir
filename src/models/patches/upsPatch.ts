@@ -27,7 +27,7 @@ export default class UPSPatch extends Patch {
     let crcAfter = '';
     let targetSize = 0;
 
-    await file.extractToTempIOFile('r', async (patchFile) => {
+    await file.extractToIOFile(async (patchFile) => {
       patchFile.seek(this.FILE_SIGNATURE.length);
       await super.readUpsUint(patchFile); // source size
       targetSize = await super.readUpsUint(patchFile);
@@ -66,7 +66,7 @@ export default class UPSPatch extends Patch {
     outputRomPath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await this.getFile().extractToTempIOFile('r', async (patchFile) => {
+    await this.getFile().extractToIOFile(async (patchFile) => {
       const header = await patchFile.readNext(4);
       if (!header.equals(UPSPatch.FILE_SIGNATURE)) {
         throw new IgirException(`UPS patch header is invalid: ${this.getFile().toString()}`);
@@ -78,9 +78,9 @@ export default class UPSPatch extends Patch {
           `UPS patch expected ROM size of ${FsUtil.sizeReadable(sourceSize)}: ${patchFile.getPathLike().toString()}`,
         );
       }
-      await Patch.readUpsUint(patchFile); // target size
+      const targetSize = await Patch.readUpsUint(patchFile);
 
-      await UPSPatch.writeOutputFile(inputRomFile, outputRomPath, patchFile, callback);
+      await UPSPatch.writeOutputFile(inputRomFile, outputRomPath, patchFile, targetSize, callback);
     });
   }
 
@@ -88,20 +88,17 @@ export default class UPSPatch extends Patch {
     inputRomFile: File,
     outputRomPath: string,
     patchFile: IOFile,
+    targetSize: number,
     callback?: FsReadCallback,
   ): Promise<void> {
-    // TODO(cemmer): we don't actually need a temp file, we're not modifying the input
-    await inputRomFile.extractToTempFile(async (tempRomFile) => {
-      const sourceFile = await IOFile.fileFrom(tempRomFile, 'r');
-
-      await FsUtil.copyFile(tempRomFile, outputRomPath);
+    await inputRomFile.extractToFile(outputRomPath);
+    await inputRomFile.extractToIOFile(async (sourceFile) => {
       const targetFile = await IOFile.fileFrom(outputRomPath, 'r+');
-
       try {
         await this.applyPatch(patchFile, sourceFile, targetFile, callback);
+        await targetFile.truncate(targetSize);
       } finally {
         await targetFile.close();
-        await sourceFile.close();
       }
     });
   }
@@ -123,10 +120,11 @@ export default class UPSPatch extends Patch {
       sourceFile.skipNext(1);
       targetFile.skipNext(1);
 
-      if (callback !== undefined) {
-        const progressPercentage = patchFile.getPosition() / patchFile.getSize();
-        callback(Math.floor(progressPercentage * targetFile.getSize()));
+      if (callback === undefined) {
+        continue;
       }
+      const progressPercentage = patchFile.getPosition() / patchFile.getSize();
+      callback(Math.floor(progressPercentage * targetFile.getSize()));
     }
   }
 

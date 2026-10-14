@@ -224,6 +224,8 @@ describe('hash: links and renames', () => {
         vi.restoreAllMocks();
       }
     });
+  });
+});
 
 describe('hash: moved inputs', () => {
   it('should not hash an archive an earlier DAT already moved', async () => {

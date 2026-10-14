@@ -224,5 +224,40 @@ describe('hash: links and renames', () => {
         vi.restoreAllMocks();
       }
     });
+
+describe('hash: moved inputs', () => {
+  it('should not hash an archive an earlier DAT already moved', async () => {
+    await FsUtil.mkdir(Temp.getTempDir(), { recursive: true });
+    const tempDir = await FsUtil.mkdtemp(path.join(Temp.getTempDir(), 'hasher'));
+    const hashSpy = vi.spyOn(FileFactory.prototype, 'archiveFileFrom');
+    try {
+      const zipPath = path.join(tempDir, 'foobar.zip');
+      await FsUtil.copyFile(path.join(FIXTURE_ROMS_DIR, 'zip', 'foobar.zip'), zipPath);
+      const archiveEntry = await ArchiveEntry.entryOf({
+        archive: new Zip(zipPath),
+        entryPath: 'foobar.lnx',
+      });
+      const archiveFile = new ArchiveFile(archiveEntry);
+      const outputFile = await File.fileOf({ filePath: path.join(tempDir, 'out', 'foobar.zip') });
+      const rom = new ROM({ name: 'foobar.zip', size: archiveFile.getSize() });
+      const candidates = [
+        new WriteCandidate(new Game({ name: 'foobar' }), [
+          new ROMWithFiles(rom, archiveFile, outputFile),
+        ]),
+      ];
+      await FsUtil.mv(zipPath, path.join(tempDir, 'moved.zip'));
+
+      const options = new Options({ commands: ['move', 'test'], output: tempDir });
+      const result = await buildHasher(options).hash(
+        new LogiqxDAT({ header: new Header() }),
+        candidates,
+      );
+
+      expect(hashSpy).not.toHaveBeenCalled();
+      expect(result).toEqual(candidates);
+    } finally {
+      vi.restoreAllMocks();
+      await FsUtil.rm(tempDir, { recursive: true, force: true });
+    }
   });
 });

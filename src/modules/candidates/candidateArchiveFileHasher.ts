@@ -95,10 +95,13 @@ export default class CandidateArchiveFileHasher extends Module {
       candidates.map(async (candidate) => {
         // A WriteCandidate with multiple ROMs with have duplicate input files, so we de-duplicate them for semaphore
         // efficiency, and to provide a more accurate progress bar
+        // An input that a ROM in an earlier DAT already moved is gone; the writer copies it from
+        // where it went
         const romsWithFilesToHash: ROMWithFiles[] = [];
         for (const romWithFiles of candidate.getRomsWithFiles()) {
           if (
             this.romWithFilesNeedsProcessing(romWithFiles) &&
+            (await FsUtil.exists(romWithFiles.getInputFile().getFilePath())) &&
             !(await this.willBeRenamed(romWithFiles))
           ) {
             romsWithFilesToHash.push(romWithFiles);

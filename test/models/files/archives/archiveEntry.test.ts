@@ -1,8 +1,10 @@
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 import MappableSemaphore from '../../../../src/async/mappableSemaphore.js';
 import FileCache from '../../../../src/cache/fileCache.js';
+import IgirException from '../../../../src/exceptions/igirException.js';
 import FileFactory from '../../../../src/factories/fileFactory.js';
 import Temp from '../../../../src/globals/temp.js';
 import ArchiveEntry from '../../../../src/models/files/archives/archiveEntry.js';
@@ -18,6 +20,38 @@ import ROMScanner from '../../../../src/modules/roms/romScanner.js';
 import bufferUtil from '../../../../src/utils/bufferUtil.js';
 import FsUtil from '../../../../src/utils/fsUtil.js';
 import ProgressBarFake from '../../../console/progressBarFake.js';
+
+describe('constructor', () => {
+  test.each([
+    '..',
+    '../evil.rom',
+    '../../../../tmp/evil.rom',
+    'roms/../../evil.rom',
+    'roms/..',
+    '..\\evil.rom',
+    'roms\\..\\..\\evil.rom',
+    '/etc/passwd',
+    '//server/share/evil.rom',
+    'C:\\Windows\\evil.rom',
+    'c:/windows/evil.rom',
+  ])('should throw on an entry path that escapes the archive: %s', async (entryPath) => {
+    const archive = new Zip('/some/archive.zip');
+    await expect(ArchiveEntry.entryOf({ archive, entryPath })).rejects.toThrow(IgirException);
+  });
+
+  test.each([
+    'Tetris (World).gb',
+    'Nintendo - Game Boy/Tetris (World).gb',
+    './Tetris (World).gb',
+    // Only whole segments count, these are all legal filenames
+    'Final Fantasy VII..disc1.bin',
+    '..hidden.rom',
+    'Game.../rom.bin',
+  ])('should not throw on a legal entry path: %s', async (entryPath) => {
+    const archive = new Zip('/some/archive.zip');
+    await expect(ArchiveEntry.entryOf({ archive, entryPath })).resolves.toBeDefined();
+  });
+});
 
 describe('getEntryPath', () => {
   test.each(['something.rom', 'foo/bar.rom'])(
@@ -824,6 +858,28 @@ describe('copyToTempFile', () => {
   });
 });
 
+describe('extractToIOFile', () => {
+  it('should read archived files from a temp file and remove it after', async () => {
+    const archivePath = path.join('test', 'fixtures', 'roms', 'zip', 'fourfive.zip');
+    const archiveEntries = await new Zip(archivePath).getArchiveEntries(ChecksumBitmask.CRC32);
+    expect(archiveEntries.length).toBeGreaterThan(0);
+
+    for (const archiveEntry of archiveEntries) {
+      const result = await archiveEntry.extractToIOFile(async (ioFile) => ({
+        pathLike: ioFile.getPathLike().toString(),
+        crc32: zlib
+          .crc32(await ioFile.readAt(0, ioFile.getSize()))
+          .toString(16)
+          .padStart(8, '0'),
+      }));
+
+      expect(result.crc32).toEqual(archiveEntry.getCrc32());
+      expect(result.pathLike).not.toEqual(archivePath);
+      await expect(FsUtil.exists(result.pathLike)).resolves.toEqual(false);
+    }
+  });
+});
+
 // Note: this will only return valid archives with at least one file
 const scannedFiles = await new ROMScanner(
   new Options({
@@ -850,6 +906,34 @@ describe('createReadStream', () => {
       const contents = (await bufferUtil.fromReadable(readable)).toString();
       expect(contents).toBeTruthy();
     });
+  });
+
+  test.each(
+    archiveEntries.filter((file) => file.getSize() > 0).map((file) => [file.toString(), file]),
+  )('should read byte ranges of archived files: %s', async (_, archiveEntry) => {
+    const contents = await archiveEntry.createReadStream(
+      async (readable) => await bufferUtil.fromReadable(readable),
+    );
+
+    for (const { start, end } of [
+      { start: 0, end: 15 },
+      { start: 3, end: 18 },
+      { start: 0, end: contents.length - 1 },
+      { start: contents.length - 1, end: contents.length + 100 },
+    ]) {
+      const range = await archiveEntry.createReadStream(
+        async (readable) => await bufferUtil.fromReadable(readable),
+        start,
+        end,
+      );
+      const expected = contents.subarray(start, end + 1);
+      expect({ start, end, length: range.length, equal: range.equals(expected) }).toEqual({
+        start,
+        end,
+        length: expected.length,
+        equal: true,
+      });
+    }
   });
 });
 

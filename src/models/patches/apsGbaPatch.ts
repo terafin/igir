@@ -19,10 +19,10 @@ export default class APSGBAPatch extends Patch {
     const crcBefore = super.getCrcFromPath(file.getExtractedFilePath());
     let targetSize = 0;
 
-    await file.extractToTempIOFile('r', async (patchFile) => {
-      patchFile.seek(this.FILE_SIGNATURE.length);
-      patchFile.skipNext(4); // original file size
-      targetSize = (await patchFile.readNext(4)).readUInt32LE();
+    await file.extractToIOFile(async (patchIOFile) => {
+      patchIOFile.seek(this.FILE_SIGNATURE.length);
+      patchIOFile.skipNext(4); // original file size
+      targetSize = (await patchIOFile.readNext(4)).readUInt32LE();
     });
 
     return new APSGBAPatch(file, crcBefore, undefined, targetSize);
@@ -36,69 +36,74 @@ export default class APSGBAPatch extends Patch {
     outputRomPath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await this.getFile().extractToTempIOFile('r', async (patchFile) => {
-      const header = await patchFile.readNext(APSGBAPatch.FILE_SIGNATURE.length);
+    await this.getFile().extractToIOFile(async (patchIOFile) => {
+      const header = await patchIOFile.readNext(APSGBAPatch.FILE_SIGNATURE.length);
       if (!header.equals(APSGBAPatch.FILE_SIGNATURE)) {
         throw new IgirException(`APS (GBA) patch header is invalid: ${this.getFile().toString()}`);
       }
 
-      const originalSize = (await patchFile.readNext(4)).readUInt32LE();
+      const originalSize = (await patchIOFile.readNext(4)).readUInt32LE();
       if (inputRomFile.getSize() !== originalSize) {
         throw new IgirException(
           `APS (GBA) patch expected ROM size of ${FsUtil.sizeReadable(originalSize)}: ${this.getFile().toString()}`,
         );
       }
 
-      patchFile.skipNext(4); // patched size
+      const targetSize = (await patchIOFile.readNext(4)).readUInt32LE();
 
-      await APSGBAPatch.writeOutputFile(inputRomFile, outputRomPath, patchFile, callback);
+      await APSGBAPatch.writeOutputFile(
+        inputRomFile,
+        outputRomPath,
+        patchIOFile,
+        targetSize,
+        callback,
+      );
     });
   }
 
   private static async writeOutputFile(
     inputRomFile: File,
     outputRomPath: string,
-    patchFile: IOFile,
+    patchIOFile: IOFile,
+    targetSize: number,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await inputRomFile.extractToTempFile(async (tempRomFile) => {
-      const sourceFile = await IOFile.fileFrom(tempRomFile, 'r');
-
-      await FsUtil.copyFile(tempRomFile, outputRomPath);
-      const targetFile = await IOFile.fileFrom(outputRomPath, 'r+');
-
+    await inputRomFile.extractToFile(outputRomPath);
+    await inputRomFile.extractToIOFile(async (sourceIOFile) => {
+      const targetIOFile = await IOFile.fileFrom(outputRomPath, 'r+');
       try {
-        await this.applyPatch(patchFile, sourceFile, targetFile, callback);
+        await this.applyPatch(patchIOFile, sourceIOFile, targetIOFile, callback);
+        await targetIOFile.truncate(targetSize);
       } finally {
-        await targetFile.close();
-        await sourceFile.close();
+        await targetIOFile.close();
       }
     });
   }
 
   private static async applyPatch(
-    patchFile: IOFile,
-    sourceFile: IOFile,
-    targetFile: IOFile,
+    patchIOFile: IOFile,
+    sourceIOFile: IOFile,
+    targetIOFile: IOFile,
     callback?: FsReadCallback,
   ): Promise<void> {
-    while (patchFile.getPosition() < patchFile.getSize()) {
-      const offset = (await patchFile.readNext(4)).readUInt32LE();
-      patchFile.skipNext(2); // CRC16 of original 64KiB block
-      patchFile.skipNext(2); // CRC16 of patched 64KiB block
-      const xorData = await patchFile.readNext(1024 * 1024);
+    while (patchIOFile.getPosition() < patchIOFile.getSize()) {
+      const offset = (await patchIOFile.readNext(4)).readUInt32LE();
+      patchIOFile.skipNext(2); // CRC16 of original 64KiB block
+      patchIOFile.skipNext(2); // CRC16 of patched 64KiB block
+      const xorData = await patchIOFile.readNext(64 * 1024);
 
-      const sourceData = await sourceFile.readAt(offset, xorData.length);
-      const targetData = Buffer.allocUnsafe(xorData.length);
-      for (const [idx, xorDatum] of xorData.entries()) {
-        targetData[idx] = (idx < sourceData.length ? sourceData[idx] : 0x00) ^ xorDatum;
+      const sourceData = await sourceIOFile.readAt(offset, xorData.length);
+      // Bytes past the end of the source are 0x00, so they're left as the XOR data
+      for (const [i, sourceDatum] of sourceData.entries()) {
+        xorData[i] ^= sourceDatum;
       }
-      await targetFile.writeAt(targetData, offset);
+      await targetIOFile.writeAt(xorData, offset);
 
-      if (callback !== undefined) {
-        const progressPercentage = patchFile.getPosition() / patchFile.getSize();
-        callback(Math.floor(progressPercentage * targetFile.getSize()));
+      if (callback === undefined) {
+        continue;
       }
+      const progressPercentage = patchIOFile.getPosition() / patchIOFile.getSize();
+      callback(Math.floor(progressPercentage * targetIOFile.getSize()));
     }
   }
 }

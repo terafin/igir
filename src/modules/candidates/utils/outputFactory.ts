@@ -179,7 +179,7 @@ export default class OutputFactory {
       output = path.join(output, mirroredDirPath);
     }
 
-    const datFilePath = dat.getFilePath();
+    const datFilePath = dat.getFile()?.getFilePath();
     if (
       options.getDirDatMirror() &&
       options.getDatPaths().length > 0 &&
@@ -199,11 +199,13 @@ export default class OutputFactory {
     }
 
     if (options.getDirDatName() && dat.getName()) {
-      output = path.join(output, dat.getName());
+      // Don't allow DAT names to perform directory traversal
+      output = path.join(output, dat.getName().replaceAll(/[\\/]/g, '_'));
     }
     const datDescription = dat.getDescription();
     if (options.getDirDatDescription() && datDescription) {
-      output = path.join(output, datDescription);
+      // Don't allow DAT descriptions to perform directory traversal
+      output = path.join(output, datDescription.replaceAll(/[\\/]/g, '_'));
     }
 
     const dirLetter = this.getDirLetterParsed(options, romBasename, romBasenames);
@@ -232,8 +234,12 @@ export default class OutputFactory {
 
     const leftoverTokens = result.match(this.LEFTOVER_TOKEN_REGEX);
     if (leftoverTokens !== null && leftoverTokens.length > 0) {
+      const consoleTokenNames = this.loadConsoleTokenNames(options.getOutputConsoleTokens());
+      const consoleHint = leftoverTokens.some((token) => consoleTokenNames.has(token.slice(1, -1)))
+        ? `, no console is known for the DAT "${dat.getName()}"`
+        : '';
       throw new TokenReplacementException(
-        `failed to replace output token${leftoverTokens.length === 1 ? '' : 's'}: ${leftoverTokens.join(', ')}`,
+        `failed to replace output token${leftoverTokens.length === 1 ? '' : 's'}: ${leftoverTokens.join(', ')}${consoleHint}`,
       );
     }
 
@@ -275,11 +281,29 @@ export default class OutputFactory {
 
   private static replaceDatTokens(input: string, dat: DAT): string {
     let output = input;
+    const datFile = dat.getFile();
+    if (datFile) {
+      output = output.replace(
+        '{datFileName}',
+        path.parse(datFile.getExtractedFilePath()).name.replaceAll(/[\\/]/g, '_'),
+      );
+    }
+
     output = output.replace('{datName}', dat.getName().replaceAll(/[\\/]/g, '_'));
 
     const description = dat.getDescription();
     if (description) {
       output = output.replace('{datDescription}', description.replaceAll(/[\\/]/g, '_'));
+    }
+
+    const version = dat.getVersion();
+    if (version) {
+      output = output.replace('{datVersion}', version.replaceAll(/[\\/]/g, '_'));
+    }
+
+    const date = dat.getDate();
+    if (date) {
+      output = output.replace('{datDate}', date.replaceAll(/[\\/]/g, '_'));
     }
 
     return output;
@@ -338,6 +362,15 @@ export default class OutputFactory {
       }
       return new ConsoleTokens(new RegExp(pattern, flags || undefined), extensions, tokensMap);
     });
+  }
+
+  @Memoize()
+  private static loadConsoleTokenNames(filePath: string | undefined): Set<string> {
+    return new Set(
+      this.loadTokensFile(filePath).flatMap((consoleTokens) => [
+        ...consoleTokens.getTokens().keys(),
+      ]),
+    );
   }
 
   private static getConsoleTokensForFilename(
@@ -639,12 +672,18 @@ export default class OutputFactory {
 
     // Should leave archived (are raw-copying/moving)
 
+    const archive = inputFile.getArchive();
+    const hasValidExt = archive
+      .getExtensions()
+      .some((ext) => inputFile.getFilePath().toLowerCase().endsWith(ext.toLowerCase()));
+
     // The regex is to preserve filenames that use 2+ extensions, e.g. "rom.nes.zip"
     const oldExtMatch = /[^.]+((\.[a-zA-Z0-9]+)+)$/.exec(inputFile.getFilePath());
     const oldExt =
-      oldExtMatch === null
-        ? // The input file has no extension, get the canonical extension from the {@link Archive}
-          inputFile.getArchive().getExtension()
+      oldExtMatch === null || (options.shouldFixExtension() && !hasValidExt)
+        ? // The input file has no extension, or it has an invalid one we should correct, get the
+          // canonical extension from the {@link Archive}
+          archive.getExtensions()[0]
         : // Respect the input file's extension
           oldExtMatch[1];
 

@@ -5,7 +5,11 @@ import stream from 'node:stream';
 
 import async from 'async';
 
-import { CompressionMethod, TZWriter } from '../../../../packages/torrentzip/index.js';
+import {
+  CompressionMethod,
+  tzFileNameComparator,
+  TZWriter,
+} from '../../../../packages/torrentzip/index.js';
 import type { CentralDirectoryFileHeader } from '../../../../packages/zip/index.js';
 import { ZipReader } from '../../../../packages/zip/index.js';
 import { logger } from '../../../console/logger.js';
@@ -14,18 +18,18 @@ import IgirException from '../../../exceptions/igirException.js';
 import Defaults from '../../../globals/defaults.js';
 import type { FsReadCallback } from '../../../streams/fsReadTransform.js';
 import FsReadTransform from '../../../streams/fsReadTransform.js';
-import SkipBytesTransform from '../../../streams/skipBytesTransform.js';
 import FsUtil from '../../../utils/fsUtil.js';
 import type { ZipFormatValue } from '../../options.js';
 import { ZipFormat } from '../../options.js';
 import type File from '../file.js';
 import type { ChecksumProps } from '../fileChecksums.js';
 import FileChecksums, { ChecksumBitmask } from '../fileChecksums.js';
+import type { ArchiveEntryLocation } from './archive.js';
 import Archive from './archive.js';
 import ArchiveEntry from './archiveEntry.js';
 
 /**
- * A ZIP archive (including variants like .apk, .ipa, .jar, .pk3).
+ * A ZIP archive (including variants like .apk, .ipa, .jar, .pk3, .vpk).
  */
 export default class Zip extends Archive {
   private readonly zipReader: ZipReader;
@@ -43,11 +47,11 @@ export default class Zip extends Archive {
   }
 
   static getExtensions(): string[] {
-    return ['.zip', '.zip64', '.apk', '.ipa', '.jar', '.pk3'];
+    return ['.zip', '.zip64', '.apk', '.ipa', '.jar', '.pk3', '.vpk'];
   }
 
-  getExtension(): string {
-    return Zip.getExtensions()[0];
+  getExtensions(): string[] {
+    return Zip.getExtensions();
   }
 
   /**
@@ -102,6 +106,12 @@ export default class Zip extends Archive {
           } finally {
             entryStream.destroy();
           }
+        } else {
+          // The central directory's CRC32 is used, so there's nothing to read
+          overallProgress += entryFile.uncompressedSizeResolved();
+          if (callback) {
+            callback(overallProgress);
+          }
         }
         const { crc32, ...checksumsWithoutCrc } = checksums;
 
@@ -129,7 +139,7 @@ export default class Zip extends Archive {
    * Extract the named entry from the ZIP to the given file path.
    */
   async extractEntryToFile(
-    entryPath: string,
+    location: ArchiveEntryLocation,
     extractedFilePath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
@@ -138,7 +148,7 @@ export default class Zip extends Archive {
       await FsUtil.mkdir(extractedDir, { recursive: true });
     }
 
-    await this.extractEntryToStream(entryPath, async (readable) => {
+    await this.extractEntryToStream(location, async (readable) => {
       const writeStream = fs.createWriteStream(extractedFilePath);
       if (callback) {
         await stream.promises.pipeline(readable, new FsReadTransform(callback), writeStream);
@@ -152,9 +162,10 @@ export default class Zip extends Archive {
    * Invoke the callback with a readable stream of the named entry's uncompressed bytes.
    */
   override async extractEntryToStream<T>(
-    entryPath: string,
+    { entryPath }: ArchiveEntryLocation,
     callback: (readable: Readable) => Promise<T> | T,
     start = 0,
+    end?: number,
   ): Promise<T> {
     // TODO(cemmer): hold a reference to the CentralDirectoryFileHeader so we don't have to parse
     const entries = await this.zipReader.centralDirectoryFileHeaders();
@@ -167,23 +178,15 @@ export default class Zip extends Archive {
       throw new IgirException(`didn't find entry '${entryPath}'`);
     }
 
-    let entryStream: stream.Readable;
+    let sourceStream: stream.Readable;
     try {
-      entryStream = await entry.uncompressedStream(Defaults.FILE_READING_CHUNK_SIZE);
+      sourceStream = await entry.uncompressedStream(Archive.getStreamChunkSize(start, end));
     } catch (error) {
       throw new Error(`failed to read '${this.getFilePath()}|${entryPath}': ${error}`, {
         cause: error,
       });
     }
-    if (start > 0) {
-      entryStream = entryStream.pipe(new SkipBytesTransform(start));
-    }
-
-    try {
-      return await callback(entryStream);
-    } finally {
-      entryStream.destroy();
-    }
+    return await Archive.pipelineRange(sourceStream, callback, start, end);
   }
 
   /**
@@ -220,18 +223,10 @@ export default class Zip extends Archive {
     compressorThreads: number,
     callback?: ProgressCallback,
   ): Promise<void> {
-    // TZWriter needs files to be sorted by lowercase
-    const inputToOutputSorted = inputToOutput.toSorted(([, outputA], [, outputB]) => {
-      const pathLowerA = outputA.getEntryPath().toLowerCase();
-      const pathLowerB = outputB.getEntryPath().toLowerCase();
-      if (pathLowerA < pathLowerB) {
-        return -1;
-      }
-      if (pathLowerA > pathLowerB) {
-        return 1;
-      }
-      return 0;
-    });
+    // TZWriter needs files to be sorted the same way TZValidator expects to find them
+    const inputToOutputSorted = inputToOutput.toSorted(([, outputA], [, outputB]) =>
+      tzFileNameComparator(outputA.getEntryPath(), outputB.getEntryPath()),
+    );
 
     let sizeWritten = 0;
     const sizeTotal = inputToOutputSorted.reduce((sum, [, output]) => sum + output.getSize(), 0);

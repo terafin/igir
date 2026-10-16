@@ -58,8 +58,11 @@ ROMs-Sorted/
 
 When using [DATs](../dats/introduction.md), you can make use of console & game information contained in them:
 
+- `{datFileName}` the matching DAT's filename without its extension (e.g. `mame2003-plus` for `mame2003-plus.xml`), including when the DAT is inside an archive
 - `{datName}` the matching DAT's name, similar to how the [`--dir-dat-name` option](path-options.md) works
 - `{datDescription}` the matching DAT's description, similar to how the [`--dir-dat-description` option](path-options.md) works
+- `{datVersion}` the matching DAT's version, exactly as written in its header (most DATs provide this, MAME DATs don't)
+- `{datDate}` the matching DAT's date, exactly as written in its header (only some DATs provide this, MAME DATs don't)
 - `{region}` each of the game's region(s) (e.g. `USA`, `EUR`, `JPN`, `WORLD`)
 - `{language}` each of the game's language(s) (e.g. `EN`, `ES`, `JA`)
 - `{type}` the game's "type," one of: `Aftermarket`, `Alpha`, `Bad`, `Beta`, `BIOS`, `Cracked`, `Debug`, `Demo`, `Device`, `Fixed`, `Hacked`, `Homebrew`, `Overdump`, `Pending Dump`, `Pirated`, `Program`, `Prototype`, `Retail` (most games will be this), `Sample`, `Trained`, `Translated`, `Unlicensed`
@@ -94,6 +97,7 @@ To help sort ROMs into unique folder structures for popular frontends & hardware
 - `{onion}` the [OnionOS / GarlicOS](../usage/handheld/onionos.md) emulator's directory for the ROM
 - `{pocket}` the [Analogue Pocket](../usage/hardware/analogue-pocket.md) core's directory for the ROM
 - `{retrodeck}` the [RetroDECK](../usage/desktop/retrodeck.md) emulator's directory for the ROM
+- `{retronas}` the [RetroNAS](../usage/desktop/retronas.md) system directory for the ROM
 - `{rocknix}` the [ROCKNIX](../usage/handheld/rocknix.md) emulator's directory for the ROM
 - `{romm}` the [RomM](../usage/desktop/romm.md) manager directory for the ROM
 - `{spruce}` the [SpruceOS](../usage/handheld/spruceos.md) emulator's directory for the ROM
@@ -142,6 +146,12 @@ ROMs-Sorted/
     ├── F-Zero (USA).sfc
     └── Mario Paint (Japan, USA) (En).sfc
 ```
+
+!!! warning
+
+    Arcade emulators such as MAME, FinalBurn Neo, and FinalBurn Alpha each require ROM sets that exactly match their version (see the [arcade docs](../usage/arcade.md)). Igir will sort arcade DATs into a frontend's generically named folder (e.g. `mame`, `fbneo`, `fba`), but it can't know which emulator version that frontend uses. You are responsible for sourcing the DAT that matches your frontend's emulator version.
+
+    Igir will not sort arcade DATs into folders named for a specific emulator version (e.g. `MAME2003PLUS`, `FBA2012`).
 
 !!! note
 

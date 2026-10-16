@@ -1,11 +1,11 @@
 import path from 'node:path';
 import type stream from 'node:stream';
 
-import chdman, { CHDType } from '../../../../../packages/chdman/index.js';
-import SkipBytesTransform from '../../../../streams/skipBytesTransform.js';
+import chdman, { CHDType } from '../../../../../addons/chdman/index.js';
 import type { ChecksumBitmaskValue } from '../../fileChecksums.js';
 import { ChecksumBitmask } from '../../fileChecksums.js';
 import type Archive from '../archive.js';
+import type { ArchiveEntryLocation } from '../archive.js';
 import ArchiveEntry from '../archiveEntry.js';
 import Chd from './chd.js';
 
@@ -82,22 +82,15 @@ export default class ChdRaw extends Chd {
    * resolve it.
    */
   override async extractEntryToStream<T>(
-    _entryPath: string,
+    _location: ArchiveEntryLocation,
     callback: (readable: stream.Readable) => Promise<T> | T,
     start = 0,
+    end?: number,
   ): Promise<T> {
-    let readable: stream.Readable = chdman.openRawReader({
+    const sourceStream: stream.Readable = chdman.openRawReader({
       inputFilename: this.getFilePath(),
+      highWaterMark: Chd.getStreamChunkSize(start, end),
     });
-    // A non-zero start offset (e.g. a detected ROM header) must skip that many
-    // leading bytes of the forward-only stream.
-    if (start > 0) {
-      readable = readable.pipe(new SkipBytesTransform(start));
-    }
-    try {
-      return await callback(readable);
-    } finally {
-      readable.destroy();
-    }
+    return await Chd.pipelineRange(sourceStream, callback, start, end);
   }
 }

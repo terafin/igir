@@ -2,11 +2,16 @@ import fs from 'node:fs';
 import stream from 'node:stream';
 import zlib from 'node:zlib';
 
+import * as tar from 'tar';
+
 import { logger } from '../../../console/logger.js';
 import IgirException from '../../../exceptions/igirException.js';
-import IOFile from '../../../models/files/ioFile.js';
+import Defaults from '../../../globals/defaults.js';
 import type { FsReadCallback } from '../../../streams/fsReadTransform.js';
+import BufferUtil from '../../../utils/bufferUtil.js';
+import StreamUtil from '../../../utils/streamUtil.js';
 import FileChecksums, { ChecksumBitmask, type ChecksumProps } from '../fileChecksums.js';
+import type { ArchiveEntryLocation } from './archive.js';
 import Archive from './archive.js';
 import ArchiveEntry from './archiveEntry.js';
 import Tar from './tar.js';
@@ -32,8 +37,8 @@ export default class Gzip extends Archive {
     return ['.gz', '.gzip'];
   }
 
-  getExtension(): string {
-    return Gzip.getExtensions()[0];
+  getExtensions(): string[] {
+    return Gzip.getExtensions();
   }
 
   /**
@@ -55,11 +60,14 @@ export default class Gzip extends Archive {
     callback?: FsReadCallback,
     shouldForceChecksumCalculation = false,
   ): Promise<ArchiveEntry<Archive>[]> {
-    // See if this file is actually a .tar.gz
-    try {
-      return await new Tar(this.getFilePath()).getArchiveEntries(checksumBitmask, callback);
-    } catch {
-      /* ignored */
+    // See if this file is actually a .tar.gz. Only try when it starts with a tar header: the tar
+    // parser buffers a plain gzipped file, which takes hours on a disc-sized image.
+    if (await this.isTar()) {
+      try {
+        return await new Tar(this.getFilePath()).getArchiveEntries(checksumBitmask, callback);
+      } catch {
+        // ignored
+      }
     }
 
     const gzipHeaderTrailer = await this.getHeaderTrailerInfo();
@@ -73,9 +81,12 @@ export default class Gzip extends Archive {
       checksumBitmask & ~ChecksumBitmask.CRC32 ||
       (shouldForceChecksumCalculation && checksumBitmask & ChecksumBitmask.CRC32)
     ) {
-      checksums = await this.extractEntryToStream('', async (readable) => {
+      checksums = await this.extractEntryToStream({ entryPath: '' }, async (readable) => {
         return await FileChecksums.hashStream(readable, checksumBitmask, callback);
       });
+    } else if (callback) {
+      // The trailer's CRC32 is used, so there's nothing to read
+      callback(gzipHeaderTrailer.size);
     }
     const { crc32, ...checksumsWithoutCrc } = checksums;
 
@@ -99,10 +110,28 @@ export default class Gzip extends Archive {
     ];
   }
 
-  private async getHeaderTrailerInfo(): Promise<GzipHeaderTrailer> {
-    const file = await IOFile.fileFrom(this.getFilePath(), 'r');
+  /**
+   * Whether the decompressed stream starts with a tar header, judged by the header's checksum,
+   * which every tar format (v7, ustar, GNU, pax) carries.
+   */
+  private async isTar(): Promise<boolean> {
     try {
-      const header = await file.readAt(0, 10);
+      const header = await this.extractEntryToStream(
+        { entryPath: '' },
+        async (readable) => await BufferUtil.fromReadable(readable),
+        0,
+        511,
+      );
+      return header.length === 512 && new tar.Header(header).cksumValid;
+    } catch {
+      return false;
+    }
+  }
+
+  private async getHeaderTrailerInfo(): Promise<GzipHeaderTrailer> {
+    const fileHandle = await fs.promises.open(this.getFilePath(), 'r');
+    try {
+      const header = await Gzip.readAt(fileHandle, 0, 10);
       if (header[0] !== 0x1f || header[1] !== 0x8b) {
         // Not a valid gzip file
         throw new IgirException('missing gzip magic number');
@@ -114,78 +143,77 @@ export default class Gzip extends Archive {
         let offset = 10;
         if (flags & 0x04) {
           // Skip FEXTRA field
-          offset += 2 + (await file.readAt(offset, 2)).readUInt16LE();
+          offset += 2 + (await Gzip.readAt(fileHandle, offset, 2)).readUInt16LE();
         }
         // Parse FNAME header
-        while (!file.isEOF()) {
-          fname += (await file.readAt(offset, 256)).toString('latin1');
-          const nullByteIdx = fname.indexOf('\0');
+        let chunk = await Gzip.readAt(fileHandle, offset, 256);
+        while (chunk.length > 0) {
+          const nullByteIdx = chunk.indexOf(0x00);
           if (nullByteIdx !== -1) {
-            fname = fname.slice(0, nullByteIdx);
+            fname += chunk.subarray(0, nullByteIdx).toString('latin1');
             break;
           }
+          fname += chunk.toString('latin1');
+          offset += chunk.length;
+          chunk = await Gzip.readAt(fileHandle, offset, 256);
         }
       }
 
-      const trailer = await file.readAt(file.getSize() - 8, 8);
-      const crc32 = trailer.readUInt32LE().toString(16).toLowerCase();
+      const { size: fileSize } = await fileHandle.stat();
+      const trailer = await Gzip.readAt(fileHandle, fileSize - 8, 8);
+      const crc32 = trailer.readUInt32LE().toString(16).toLowerCase().padStart(8, '0');
       const size = trailer.readUInt32LE(4);
 
       return { fname, crc32, size };
     } finally {
-      await file.close();
+      await fileHandle.close();
     }
+  }
+
+  /**
+   * @returns up to {@link size} bytes starting at {@link position}, fewer at the end of the file
+   */
+  private static async readAt(
+    fileHandle: fs.promises.FileHandle,
+    position: number,
+    size: number,
+  ): Promise<Buffer> {
+    const buffer = Buffer.allocUnsafe(size);
+    const { bytesRead } = await fileHandle.read(buffer, 0, size, position);
+    return buffer.subarray(0, bytesRead);
   }
 
   /**
    * Decompress the gzip file to the given path.
    */
-  async extractEntryToFile(_entryPath: string, extractedFilePath: string): Promise<void> {
+  async extractEntryToFile(
+    _location: ArchiveEntryLocation,
+    extractedFilePath: string,
+  ): Promise<void> {
     await stream.promises.pipeline(
-      fs.createReadStream(this.getFilePath()),
-      zlib.createGunzip(),
+      fs.createReadStream(this.getFilePath(), {
+        highWaterMark: Defaults.FILE_READING_CHUNK_SIZE,
+      }),
+      zlib.createGunzip({ chunkSize: Defaults.FILE_READING_CHUNK_SIZE }),
       fs.createWriteStream(extractedFilePath),
     );
   }
 
   /**
    * Decompress the gzip file and invoke the callback with a readable stream of the decompressed
-   * bytes.
+   * bytes from {@link start} to {@link end} (both inclusive).
    */
   override async extractEntryToStream<T>(
-    _entryPath: string,
+    _location: ArchiveEntryLocation,
     callback: (readable: stream.Readable) => Promise<T> | T,
+    start = 0,
+    end?: number,
   ): Promise<T> {
-    const source = fs.createReadStream(this.getFilePath());
-    const gunzip = zlib.createGunzip();
-    const pipelinePromise = stream.promises.pipeline(source, gunzip);
-
-    try {
-      const result = await callback(gunzip);
-
-      gunzip.destroy();
-      source.destroy();
-      try {
-        await pipelinePromise;
-      } catch (error) {
-        // The .destroy() calls above can cause ABORT_ERR on Node.js <24.15, or
-        // ERR_STREAM_PREMATURE_CLOSE on Node.js >=24.15
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'ABORT_ERR' && code !== 'ERR_STREAM_PREMATURE_CLOSE') {
-          throw error;
-        }
-      }
-
-      return result;
-    } catch (error) {
-      gunzip.destroy();
-      source.destroy();
-      try {
-        await pipelinePromise;
-      } catch {
-        /* ignored */
-      }
-      throw error;
-    }
+    const chunkSize = Gzip.getStreamChunkSize(start, end);
+    return await StreamUtil.pipelineSafe(
+      fs.createReadStream(this.getFilePath(), { highWaterMark: chunkSize }),
+      zlib.createGunzip({ chunkSize }),
+      async (readable) => await Gzip.pipelineRange(readable, callback, start, end),
+    );
   }
 }

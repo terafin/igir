@@ -2,14 +2,12 @@ import child_process from 'node:child_process';
 import path from 'node:path';
 
 import { parse } from '@fast-csv/parse';
-import async from 'async';
 
 import type MappableSemaphore from '../../async/mappableSemaphore.js';
 import type ProgressBar from '../../console/progressBar.js';
 import { ProgressBarSymbol } from '../../console/progressBar.js';
 import IgirException from '../../exceptions/igirException.js';
 import type FileFactory from '../../factories/fileFactory.js';
-import Defaults from '../../globals/defaults.js';
 import type DAT from '../../models/dats/dat.js';
 import type { DATObjectProps } from '../../models/dats/datObject.js';
 import DATObject from '../../models/dats/datObject.js';
@@ -100,24 +98,28 @@ export default class DATScanner extends Scanner {
     this.progressBar.setName('Downloading DATs');
     this.progressBar.setSymbol(ProgressBarSymbol.DAT_DOWNLOADING);
 
-    return (
-      await async.mapLimit(datFiles, Defaults.MAX_FS_THREADS, async (datFile: File) => {
-        try {
-          this.prefixedLogger.trace(`${datFile.toString()}: downloading`);
-          // TODO(cemmer): these never get deleted?
-          const downloadedDatFile = await datFile.downloadToTempPath();
-          this.prefixedLogger.trace(
-            `${datFile.toString()}: downloaded to '${downloadedDatFile.toString()}'`,
-          );
-          return await this.getFilesFromPaths(
-            [downloadedDatFile.getFilePath()],
-            ChecksumBitmask.NONE,
-          );
-        } catch (error) {
-          throw new IgirException(`failed to download '${datFile.toString()}': ${error}`);
-        }
-      })
-    ).flat();
+    const downloadedDatFiles = await this.mappableSemaphore.map(datFiles, async (datFile: File) => {
+      try {
+        this.prefixedLogger.trace(`${datFile.toString()}: downloading`);
+        // TODO(cemmer): these never get deleted?
+        const downloadedDatFile = await datFile.downloadToTempPath();
+        this.prefixedLogger.trace(
+          `${datFile.toString()}: downloaded to '${downloadedDatFile.toString()}'`,
+        );
+        return downloadedDatFile;
+      } catch (error) {
+        throw new IgirException(
+          `failed to download '${datFile.toString()}': ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    });
+
+    // Scan the downloaded files only after every download has released its semaphore lock, as
+    // scanning acquires locks from the same semaphore
+    return await this.getFilesFromPaths(
+      downloadedDatFiles.map((downloadedDatFile) => downloadedDatFile.getFilePath()),
+      ChecksumBitmask.NONE,
+    );
   }
 
   // Parse each file into a DAT
@@ -132,7 +134,7 @@ export default class DATScanner extends Scanner {
     this.progressBar.setSymbol(ProgressBarSymbol.DAT_PARSING);
 
     return (
-      await this.mappableSemaphore.map(datFiles, async (datFile) => {
+      await this.mappableSemaphore.map(datFiles, async (datFile: File) => {
         this.progressBar.incrementInProgress();
         const childBar = this.progressBar.addChildBar({
           name: datFile.toString(),
@@ -307,7 +309,7 @@ export default class DATScanner extends Scanner {
 
     if (datObject.datafile) {
       try {
-        return LogiqxDAT.fromObject(datObject.datafile, { filePath: datFile.getFilePath() });
+        return LogiqxDAT.fromObject(datObject.datafile, { file: datFile });
       } catch (error) {
         this.prefixedLogger.trace(`${datFile.toString()}: failed to parse DAT object: ${error}`);
         return undefined;
@@ -316,7 +318,7 @@ export default class DATScanner extends Scanner {
 
     if (datObject.mame) {
       try {
-        return MameDAT.fromObject(datObject.mame, { filePath: datFile.getFilePath() });
+        return MameDAT.fromObject(datObject.mame, { file: datFile });
       } catch (error) {
         this.prefixedLogger.trace(
           `${datFile.toString()}: failed to parse MAME DAT object: ${error}`,
@@ -328,7 +330,7 @@ export default class DATScanner extends Scanner {
     if (datObject.softwarelists) {
       try {
         return SoftwareListsDAT.fromObject(datObject.softwarelists, {
-          filePath: datFile.getFilePath(),
+          file: datFile,
         });
       } catch (error) {
         this.prefixedLogger.trace(
@@ -457,7 +459,7 @@ export default class DATScanner extends Scanner {
       });
     });
 
-    return new LogiqxDAT({ filePath: datFile.getFilePath(), header, games });
+    return new LogiqxDAT({ file: datFile, header, games });
   }
 
   /**
@@ -510,7 +512,7 @@ export default class DATScanner extends Scanner {
 
     const datName = path.parse(datFile.getExtractedFilePath()).name;
     return new LogiqxDAT({
-      filePath: datFile.getFilePath(),
+      file: datFile,
       header: new Header({
         name: datName,
         description: datName,

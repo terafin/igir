@@ -1,8 +1,10 @@
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 import MappableSemaphore from '../../../../src/async/mappableSemaphore.js';
 import FileCache from '../../../../src/cache/fileCache.js';
+import IgirException from '../../../../src/exceptions/igirException.js';
 import FileFactory from '../../../../src/factories/fileFactory.js';
 import Temp from '../../../../src/globals/temp.js';
 import ArchiveEntry from '../../../../src/models/files/archives/archiveEntry.js';
@@ -17,7 +19,40 @@ import IPSPatch from '../../../../src/models/patches/ipsPatch.js';
 import ROMScanner from '../../../../src/modules/roms/romScanner.js';
 import bufferUtil from '../../../../src/utils/bufferUtil.js';
 import FsUtil from '../../../../src/utils/fsUtil.js';
+import PathUtil from '../../../../src/utils/pathUtil.js';
 import ProgressBarFake from '../../../console/progressBarFake.js';
+
+describe('constructor', () => {
+  test.each([
+    '..',
+    '../evil.rom',
+    '../../../../tmp/evil.rom',
+    'roms/../../evil.rom',
+    'roms/..',
+    '..\\evil.rom',
+    'roms\\..\\..\\evil.rom',
+    '/etc/passwd',
+    '//server/share/evil.rom',
+    'C:\\Windows\\evil.rom',
+    'c:/windows/evil.rom',
+  ])('should throw on an entry path that escapes the archive: %s', async (entryPath) => {
+    const archive = new Zip('/some/archive.zip');
+    await expect(ArchiveEntry.entryOf({ archive, entryPath })).rejects.toThrow(IgirException);
+  });
+
+  test.each([
+    'Tetris (World).gb',
+    'Nintendo - Game Boy/Tetris (World).gb',
+    './Tetris (World).gb',
+    // Only whole segments count, these are all legal filenames
+    'Final Fantasy VII..disc1.bin',
+    '..hidden.rom',
+    'Game.../rom.bin',
+  ])('should not throw on a legal entry path: %s', async (entryPath) => {
+    const archive = new Zip('/some/archive.zip');
+    await expect(ArchiveEntry.entryOf({ archive, entryPath })).resolves.toBeDefined();
+  });
+});
 
 describe('getEntryPath', () => {
   test.each(['something.rom', 'foo/bar.rom'])(
@@ -85,7 +120,7 @@ describe('getSize', () => {
       const tempDir = await FsUtil.mkdtemp(Temp.getTempDir());
       try {
         const tempLink = path.join(tempDir, path.basename(filePath));
-        await FsUtil.symlink(path.resolve(filePath), tempLink);
+        await FsUtil.symlink(PathUtil.resolve(filePath), tempLink);
 
         const archiveEntries = await new FileFactory(new FileCache()).filesFrom(tempLink);
         expect(archiveEntries).toHaveLength(1);
@@ -824,6 +859,28 @@ describe('copyToTempFile', () => {
   });
 });
 
+describe('extractToIOFile', () => {
+  it('should read archived files from a temp file and remove it after', async () => {
+    const archivePath = path.join('test', 'fixtures', 'roms', 'zip', 'fourfive.zip');
+    const archiveEntries = await new Zip(archivePath).getArchiveEntries(ChecksumBitmask.CRC32);
+    expect(archiveEntries.length).toBeGreaterThan(0);
+
+    for (const archiveEntry of archiveEntries) {
+      const result = await archiveEntry.extractToIOFile(async (ioFile) => ({
+        pathLike: ioFile.getPathLike().toString(),
+        crc32: zlib
+          .crc32(await ioFile.readAt(0, ioFile.getSize()))
+          .toString(16)
+          .padStart(8, '0'),
+      }));
+
+      expect(result.crc32).toEqual(archiveEntry.getCrc32());
+      expect(result.pathLike).not.toEqual(archivePath);
+      await expect(FsUtil.exists(result.pathLike)).resolves.toEqual(false);
+    }
+  });
+});
+
 // Note: this will only return valid archives with at least one file
 const scannedFiles = await new ROMScanner(
   new Options({
@@ -839,17 +896,58 @@ const scannedFiles = await new ROMScanner(
 ).scan();
 const archiveEntries = scannedFiles.filter((entry) => entry instanceof ArchiveEntry);
 
-describe('createReadStream', () => {
+describe('extractToStream', () => {
   test.each(
     archiveEntries
       // Some CHDs can't/shouldn't be extracted, ignore those
       .filter((file) => !(file.getArchive() instanceof Chd) || file.getSize() > 0)
       .map((file) => [file.toString(), file]),
   )('should extract archived files: %s', async (_, archiveEntry) => {
-    await archiveEntry.createReadStream(async (readable) => {
+    await archiveEntry.extractToStream(async (readable) => {
       const contents = (await bufferUtil.fromReadable(readable)).toString();
       expect(contents).toBeTruthy();
     });
+  });
+
+  test.each(
+    archiveEntries.filter((file) => file.getSize() > 0).map((file) => [file.toString(), file]),
+  )('should read archived files from byte offsets: %s', async (_, archiveEntry) => {
+    const contents = await archiveEntry.extractToStream(
+      async (readable) => await bufferUtil.fromReadable(readable),
+    );
+
+    for (const start of [0, 3, contents.length - 1, contents.length]) {
+      const range = await archiveEntry.extractToStream(
+        async (readable) => await bufferUtil.fromReadable(readable),
+        start,
+      );
+      const expected = contents.subarray(start);
+      expect({ start, length: range.length, equal: range.equals(expected) }).toEqual({
+        start,
+        length: expected.length,
+        equal: true,
+      });
+    }
+  });
+});
+
+describe('readFirstBytes', () => {
+  test.each(
+    archiveEntries.filter((file) => file.getSize() > 0).map((file) => [file.toString(), file]),
+  )('should read the leading bytes of archived files: %s', async (_, archiveEntry) => {
+    const contents = await archiveEntry.extractToStream(
+      async (readable) => await bufferUtil.fromReadable(readable),
+    );
+
+    for (const byteCount of [1, 16, contents.length, contents.length + 100]) {
+      const firstBytes = await archiveEntry.readFirstBytes(byteCount);
+      const expected = contents.subarray(0, byteCount);
+      expect({ byteCount, length: firstBytes.length, equal: firstBytes.equals(expected) }).toEqual({
+        byteCount,
+        length: expected.length,
+        equal: true,
+      });
+    }
   });
 });
 

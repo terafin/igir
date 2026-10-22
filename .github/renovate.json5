@@ -12,20 +12,9 @@
   reviewers: ['@emmercm'],
   assignAutomerge: false, // default
 
-  // Open PRs immediately for vulnerability alerts
-  // Requires "dependency graph" as well as Dependabot "alerts" and "security updates" enabled for the repo
+  // Rely on Dependabot for security updates, as it tends to be more timely than Renovate
   vulnerabilityAlerts: {
-    labels: ['security'],
-    platformAutomerge: true,
-    // Renovate's defaults for `vulnerabilityAlerts`
-    groupName: '',
-    schedule: [],
-    dependencyDashboardApproval: false,
-    minimumReleaseAge: '',
-    rangeStrategy: 'update-lockfile',
-    commitMessageSuffix: '[SECURITY]',
-    branchTopic: '{{{datasource}}}-{{{depName}}}-vulnerability',
-    prCreation: 'immediate',
+    "enabled": false
   },
 
   // Use pseudo semantic commit (and therefore PR title) commit messages
@@ -101,6 +90,14 @@
       schedule: 'at any time',
     },
 
+    // Perform dependency replacements immediately
+    {
+      matchUpdateTypes: ['replacement'],
+      recreateWhen: 'always',
+      // Renovate's defaults for these options (overrides our global defaults)
+      schedule: 'at any time',
+    },
+
     // Perform major version updates immediately
     {
       matchUpdateTypes: ['major'],
@@ -111,10 +108,25 @@
 
   "github-actions": {
     packageRules: [
-      // Don't update some non-action packages
+      // Don't update some non-action packages, such as the runtime versions given to setup-* actions
       {
-        matchDepNames: ['python'],
+        // Dependencies that follow semver
+        matchDepNames: ['node'],
+        matchUpdateTypes: ['major'],
         enabled: false,
+      },
+      {
+        // Dependencies whose minor versions act like major versions
+        matchDepNames: ['python'],
+        matchUpdateTypes: ['major', 'minor'],
+        enabled: false,
+      },
+
+      // Emscripten 6.0.3 removed a macro that emnapi v1's JS library uses; remove this hold when
+      // updating to emnapi v2
+      {
+        matchPackageNames: ['emscripten/emsdk'],
+        allowedVersions: '<=6.0.2',
       },
 
       // Pin actions to their digest hashes, remembering the semver in a comment
@@ -172,17 +184,6 @@
         },
       },
 
-      // Update dolphin-tool, maxcso immediately
-      {
-        groupName: null,
-        matchPackageNames: [
-          'dolphin-tool',
-          'maxcso'
-        ],
-        schedule: 'at any time',
-        minimumReleaseAge: '0 hours',
-      },
-
       // Dev dependencies
       {
         // Group devDependencies together, minus type definitions for dependencies
@@ -190,6 +191,10 @@
         groupName: 'dev dependencies',
         matchDepTypes: ['devDependencies'],
         matchPackageNames: [
+          // Packages that affect the compiled addons, which ship with igir
+          '!emnapi',
+          '!node-addon-api',
+          '!node-gyp',
           '!@types/async',
           '!@types/cli-progress',
           '!@types/micromatch',

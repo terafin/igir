@@ -7,11 +7,13 @@ import stream from 'node:stream';
 import { Exclude, Expose, instanceToPlain, plainToClassFromExist } from 'class-transformer';
 
 import IgirException from '../../exceptions/igirException.js';
-import Defaults from '../../globals/defaults.js';
 import Temp from '../../globals/temp.js';
 import IOFile from '../../models/files/ioFile.js';
 import FsReadTransform, { FsReadCallback } from '../../streams/fsReadTransform.js';
+import PadEndTransform from '../../streams/padEndTransform.js';
+import BufferUtil from '../../utils/bufferUtil.js';
 import FsUtil from '../../utils/fsUtil.js';
+import PathUtil from '../../utils/pathUtil.js';
 import StreamUtil from '../../utils/streamUtil.js';
 import URLUtil from '../../utils/urlUtil.js';
 import Patch from '../patches/patch.js';
@@ -82,7 +84,7 @@ export default class File implements FileProps {
   protected constructor(fileProps: FileProps) {
     const isUrl = URLUtil.canParse(fileProps.filePath);
 
-    this.filePath = isUrl ? fileProps.filePath : path.resolve(fileProps.filePath);
+    this.filePath = isUrl ? fileProps.filePath : PathUtil.resolve(fileProps.filePath);
     this.size = fileProps.size ?? 0;
     this.checksumBitmask = fileProps.checksumBitmask;
     this.crc32 = fileProps.crc32?.toLowerCase().replace(/^0x/, '').padStart(8, '0');
@@ -149,7 +151,11 @@ export default class File implements FileProps {
         (!finalSha1WithHeader && checksumBitmask & ChecksumBitmask.SHA1) ||
         (!finalSha256WithHeader && checksumBitmask & ChecksumBitmask.SHA256)
       ) {
-        const headeredChecksums = await FileChecksums.hashFile(fileProps.filePath, checksumBitmask);
+        const headeredChecksums = await FileChecksums.hashFile(
+          fileProps.filePath,
+          checksumBitmask,
+          finalSize,
+        );
         finalCrcWithHeader = headeredChecksums.crc32 ?? finalCrcWithHeader;
         finalMd5WithHeader = headeredChecksums.md5 ?? finalMd5WithHeader;
         finalSha1WithHeader = headeredChecksums.sha1 ?? finalSha1WithHeader;
@@ -159,6 +165,7 @@ export default class File implements FileProps {
         const headerlessChecksums = await FileChecksums.hashFile(
           fileProps.filePath,
           checksumBitmask,
+          finalSize,
           fileProps.fileHeader.getDataOffsetBytes(),
         );
         finalCrcWithoutHeader = headerlessChecksums.crc32;
@@ -327,9 +334,8 @@ export default class File implements FileProps {
     if (!(await FsUtil.exists(tempDir))) {
       await FsUtil.mkdir(tempDir, { recursive: true });
     }
-    await this.extractToFile(tempFile);
-
     try {
+      await this.extractToFile(tempFile);
       return await callback(tempFile);
     } finally {
       await FsUtil.rm(tempFile, { force: true });
@@ -337,21 +343,27 @@ export default class File implements FileProps {
   }
 
   /**
-   * Copy this file to a temporary path, open it as an {@link IOFile} with the given flags,
-   * invoke the callback with the open handle, then close and clean up.
+   * Open this file read-only as an {@link IOFile}, invoke the callback with it, then close it.
+   * Files that can't be read in place are first extracted to a temporary path.
    */
-  async extractToTempIOFile<T>(
-    flags: fs.OpenMode,
+  async extractToIOFile<T>(callback: (ioFile: IOFile) => T | Promise<T>): Promise<T> {
+    return await File.readWithIOFile(this.getFilePath(), callback);
+  }
+
+  /**
+   * Open {@link filePath} read-only as an {@link IOFile}, invoke the callback with it, then close
+   * it.
+   */
+  protected static async readWithIOFile<T>(
+    filePath: string,
     callback: (ioFile: IOFile) => T | Promise<T>,
   ): Promise<T> {
-    return await this.extractToTempFile(async (tempFile) => {
-      const ioFile = await IOFile.fileFrom(tempFile, flags);
-      try {
-        return await callback(ioFile);
-      } finally {
-        await ioFile.close();
-      }
-    });
+    const ioFile = await IOFile.fileFrom(filePath, 'r');
+    try {
+      return await callback(ioFile);
+    } finally {
+      await ioFile.close();
+    }
   }
 
   /**
@@ -362,9 +374,9 @@ export default class File implements FileProps {
     destinationPath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    // If there are any paddings then we must use createTransformedReadStream()
+    // If there are any paddings then we must use extractAndTransformToStream()
     if (this.getPaddings().length > 0) {
-      await this.createTransformedReadStream(async (readable) => {
+      await this.extractAndTransformToStream(async (readable) => {
         const writeStream = fs.createWriteStream(destinationPath);
         if (callback) {
           await stream.promises.pipeline(readable, new FsReadTransform(callback), writeStream);
@@ -396,9 +408,9 @@ export default class File implements FileProps {
       const tempFile = await FsUtil.mktemp(
         path.join(Temp.getTempDir(), path.basename(this.getExtractedFilePath())),
       );
-      await patch.createPatchedFile(this, tempFile, callback);
       try {
-        await File.createStreamFromFile(
+        await patch.createPatchedFile(this, tempFile, callback);
+        await File.streamFilePath(
           tempFile,
           async (readable) => {
             const writeStream = fs.createWriteStream(destinationPath);
@@ -408,6 +420,7 @@ export default class File implements FileProps {
               await stream.promises.pipeline(readable, writeStream);
             }
           },
+          patch.getSizeAfter(),
           start,
         );
         return;
@@ -417,7 +430,7 @@ export default class File implements FileProps {
     }
 
     // Headered: remove the header using streaming
-    await this.createReadStream(async (readable) => {
+    await this.extractToStream(async (readable) => {
       const writeStream = fs.createWriteStream(destinationPath);
       if (callback) {
         await stream.promises.pipeline(readable, new FsReadTransform(callback), writeStream);
@@ -428,21 +441,38 @@ export default class File implements FileProps {
   }
 
   /**
-   * Invoke the callback with a readable stream of this file's bytes, optionally starting at a
-   * byte offset.
+   * Invoke the callback with a readable stream of this file's bytes, from the {@link start} byte
+   * offset to the end of the file.
    */
-  async createReadStream<T>(
+  async extractToStream<T>(
     callback: (readable: stream.Readable) => T | Promise<T>,
     start = 0,
   ): Promise<T> {
-    return await File.createStreamFromFile(this.getFilePath(), callback, start);
+    return await File.streamFilePath(this.getFilePath(), callback, this.getSize(), start);
+  }
+
+  /**
+   * Read this file's first {@link byteCount} bytes.
+   * @returns those bytes, or fewer if the file is shorter
+   */
+  async readFirstBytes(byteCount: number): Promise<Buffer> {
+    if (byteCount <= 0) {
+      return Buffer.alloc(0);
+    }
+    return await File.streamFilePath(
+      this.getFilePath(),
+      async (readable) => await BufferUtil.fromReadableFirstBytes(readable, byteCount),
+      this.getSize(),
+      0,
+      byteCount - 1,
+    );
   }
 
   /**
    * Invoke the callback with a readable stream of this file's bytes after stripping any header
    * and applying any associated patch.
    */
-  async createTransformedReadStream<T>(
+  async extractAndTransformToStream<T>(
     callback: (readable: stream.Readable) => T | Promise<T>,
   ): Promise<T> {
     const start = this.getFileHeader()?.getDataOffsetBytes() ?? 0;
@@ -458,17 +488,16 @@ export default class File implements FileProps {
         ? callback
         : async (readable: stream.Readable): Promise<T> => {
             const padding = paddings[0];
-            const padded = StreamUtil.padEnd(
+            return await StreamUtil.pipelineSafe(
               readable,
-              padding.getPaddedSize(),
-              padding.getFillByte(),
+              new PadEndTransform(padding.getPaddedSize(), padding.getFillByte()),
+              callback,
             );
-            return await callback(padded);
           };
 
     // Simple case: create a read stream at an offset
     if (!patch) {
-      return await this.createReadStream(wrappedCallback, start);
+      return await this.extractToStream(wrappedCallback, start);
     }
 
     // Complex case: create a temp patched file and then create read stream at an offset
@@ -477,7 +506,7 @@ export default class File implements FileProps {
     );
     try {
       await patch.createPatchedFile(this, tempFile);
-      return await File.createStreamFromFile(tempFile, wrappedCallback, start);
+      return await File.streamFilePath(tempFile, wrappedCallback, patch.getSizeAfter(), start);
     } finally {
       await FsUtil.rm(tempFile, { force: true });
     }
@@ -485,18 +514,20 @@ export default class File implements FileProps {
 
   /**
    * Open a file path as a readable stream and invoke the callback with it, optionally bounded
-   * by start/end byte offsets.
+   * by start/end byte offsets. Reads are sized from the file's {@link size}, when known, so that
+   * they don't allocate more memory than necessary.
    */
-  static async createStreamFromFile<T>(
+  static async streamFilePath<T>(
     filePath: fs.PathLike,
     callback: (readable: stream.Readable) => Promise<T> | T,
+    size?: number,
     start?: number,
     end?: number,
   ): Promise<T> {
     const stream = fs.createReadStream(filePath, {
       start,
       end,
-      highWaterMark: Defaults.FILE_READING_CHUNK_SIZE,
+      highWaterMark: StreamUtil.getChunkSize(start, end, size),
     });
     try {
       return await callback(stream);
@@ -544,13 +575,21 @@ export default class File implements FileProps {
             return;
           }
 
-          const writeStream = fs.createWriteStream(filePath);
-          res.pipe(writeStream);
-          writeStream.on('error', reject);
-          writeStream.on('finish', async () => {
-            writeStream.close();
-            resolve(await File.fileOf({ filePath }, this.getChecksumBitmask()));
-          });
+          if (res.statusCode === undefined || res.statusCode < 200 || res.statusCode >= 300) {
+            reject(
+              new IgirException(
+                `HTTP ${res.statusCode ?? '?'}${res.statusMessage === undefined || res.statusMessage === '' ? '' : ` ${res.statusMessage}`}`,
+              ),
+            );
+            res.destroy();
+            return;
+          }
+
+          stream.promises
+            .pipeline(res, fs.createWriteStream(filePath))
+            .then(async () => await File.fileOf({ filePath }, this.getChecksumBitmask()))
+            .then(resolve)
+            .catch(reject);
         },
       );
       req.on('error', reject).on('timeout', () => {

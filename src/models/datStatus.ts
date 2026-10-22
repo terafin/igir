@@ -58,15 +58,9 @@ export default class DATStatus {
   constructor(options: Options, dat: DAT, candidates: WriteCandidate[]) {
     this.dat = dat;
 
-    const indexedCandidates = candidates.reduce((map, candidate) => {
-      const key = candidate.getGame().hashCode();
-      if (map.has(key)) {
-        map.get(key)?.push(candidate);
-      } else {
-        map.set(key, [candidate]);
-      }
-      return map;
-    }, new Map<string, WriteCandidate[]>());
+    const indexedCandidates = Map.groupBy(candidates, (candidate) =>
+      candidate.getGame().hashCode(),
+    );
 
     // Un-patched ROMs
     for (const game of dat.getGames()) {
@@ -74,18 +68,19 @@ export default class DATStatus {
 
       const expectedCount = DATStatus.getExpectedFileCount(game, options);
       const gameCandidates = indexedCandidates.get(game.hashCode());
-      if (gameCandidates !== undefined || expectedCount === 0) {
-        const gameCandidate = gameCandidates?.at(0);
-
-        if (gameCandidate && gameCandidate.getRomsWithFiles().length !== expectedCount) {
-          // The found ReleaseCandidate is incomplete
-          DATStatus.pushValueIntoMap(this.incompleteRomTypesToCandidates, game, gameCandidate);
-          continue;
-        }
-
-        // The found ReleaseCandidate is complete
-        DATStatus.pushValueIntoMap(this.foundRomTypesToCandidates, game, gameCandidate);
+      if (gameCandidates === undefined && expectedCount !== 0) {
+        continue;
       }
+      const gameCandidate = gameCandidates?.at(0);
+
+      if (gameCandidate && gameCandidate.getRomsWithFiles().length !== expectedCount) {
+        // The found ReleaseCandidate is incomplete
+        DATStatus.pushValueIntoMap(this.incompleteRomTypesToCandidates, game, gameCandidate);
+        continue;
+      }
+
+      // The found ReleaseCandidate is complete
+      DATStatus.pushValueIntoMap(this.foundRomTypesToCandidates, game, gameCandidate);
     }
 
     // Patched ROMs
@@ -348,9 +343,9 @@ export default class DATStatus {
 
   private static getAllowedTypes(options: Options): ROMTypeValue[] {
     return [
-      !options.getOnlyBios() && !options.getOnlyDevice() && !options.getOnlyRetail()
-        ? ROMType.GAME
-        : undefined,
+      options.getOnlyBios() || options.getOnlyDevice() || options.getOnlyRetail()
+        ? undefined
+        : ROMType.GAME,
       options.getOnlyBios() || (!options.getNoBios() && !options.getOnlyDevice())
         ? ROMType.BIOS
         : undefined,

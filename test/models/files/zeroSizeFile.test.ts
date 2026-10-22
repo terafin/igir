@@ -1,3 +1,4 @@
+import os from 'node:os';
 import path from 'node:path';
 
 import Temp from '../../../src/globals/temp.js';
@@ -35,6 +36,28 @@ describe('extractToTempFile', () => {
   });
 });
 
+describe('extractToIOFile', () => {
+  it('should read zero bytes', async () => {
+    const contents = await ZeroSizeFile.getInstance().extractToIOFile(
+      async (ioFile) => await ioFile.readAt(0, 1),
+    );
+    expect(contents).toHaveLength(0);
+  });
+
+  it('should read from the null device without creating a temp file', async () => {
+    const props = await ZeroSizeFile.getInstance().extractToIOFile((ioFile) => ({
+      pathLike: ioFile.getPathLike(),
+      size: ioFile.getSize(),
+      isEOF: ioFile.isEOF(),
+    }));
+    expect(props).toEqual({
+      pathLike: os.devNull,
+      size: 0,
+      isEOF: true,
+    });
+  });
+});
+
 describe('extractAndTransformToFile', () => {
   it('should extract to specified path', async () => {
     const tempDir = await FsUtil.mkdtemp(Temp.getTempDir());
@@ -49,9 +72,9 @@ describe('extractAndTransformToFile', () => {
   });
 });
 
-describe('createReadStream', () => {
+describe('extractToStream', () => {
   it('should create a readable of length zero', async () => {
-    const contents = await ZeroSizeFile.getInstance().createReadStream(
+    const contents = await ZeroSizeFile.getInstance().extractToStream(
       async (readable) => await BufferUtil.fromReadable(readable),
     );
     expect(contents).toBeDefined();
@@ -59,9 +82,15 @@ describe('createReadStream', () => {
   });
 });
 
-describe('createTransformedReadStream', () => {
+describe('readFirstBytes', () => {
+  it('should read no bytes', async () => {
+    await expect(ZeroSizeFile.getInstance().readFirstBytes()).resolves.toEqual(Buffer.alloc(0));
+  });
+});
+
+describe('extractAndTransformToStream', () => {
   it('should create a readable of length zero', async () => {
-    const contents = await ZeroSizeFile.getInstance().createTransformedReadStream(
+    const contents = await ZeroSizeFile.getInstance().extractAndTransformToStream(
       async (readable) => await BufferUtil.fromReadable(readable),
     );
     expect(contents).toBeDefined();

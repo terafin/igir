@@ -39,6 +39,26 @@ const GameStatusInverted = Object.fromEntries(
   Object.entries(GameStatus).map(([key, value]) => [value, key]),
 ) as Record<GameStatusValue, GameStatusKey>;
 
+const CSV_HEADERS = [
+  'DAT Name',
+  'Game Name',
+  'Status',
+  'ROM Files',
+  'Patched',
+  'BIOS',
+  'Retail Release',
+  'Unlicensed',
+  'Debug',
+  'Demo',
+  'Beta',
+  'Sample',
+  'Prototype',
+  'Program',
+  'Aftermarket',
+  'Homebrew',
+  'Bad',
+];
+
 /**
  * Parse and hold information about every {@link Game} in a {@link DAT}, as well as which
  * {@link Game}s were found (had a {@link WriteCandidate} created for it).
@@ -58,15 +78,9 @@ export default class DATStatus {
   constructor(options: Options, dat: DAT, candidates: WriteCandidate[]) {
     this.dat = dat;
 
-    const indexedCandidates = candidates.reduce((map, candidate) => {
-      const key = candidate.getGame().hashCode();
-      if (map.has(key)) {
-        map.get(key)?.push(candidate);
-      } else {
-        map.set(key, [candidate]);
-      }
-      return map;
-    }, new Map<string, WriteCandidate[]>());
+    const indexedCandidates = Map.groupBy(candidates, (candidate) =>
+      candidate.getGame().hashCode(),
+    );
 
     // Un-patched ROMs
     for (const game of dat.getGames()) {
@@ -74,18 +88,19 @@ export default class DATStatus {
 
       const expectedCount = DATStatus.getExpectedFileCount(game, options);
       const gameCandidates = indexedCandidates.get(game.hashCode());
-      if (gameCandidates !== undefined || expectedCount === 0) {
-        const gameCandidate = gameCandidates?.at(0);
-
-        if (gameCandidate && gameCandidate.getRomsWithFiles().length !== expectedCount) {
-          // The found ReleaseCandidate is incomplete
-          DATStatus.pushValueIntoMap(this.incompleteRomTypesToCandidates, game, gameCandidate);
-          continue;
-        }
-
-        // The found ReleaseCandidate is complete
-        DATStatus.pushValueIntoMap(this.foundRomTypesToCandidates, game, gameCandidate);
+      if (gameCandidates === undefined && expectedCount !== 0) {
+        continue;
       }
+      const gameCandidate = gameCandidates?.at(0);
+
+      if (gameCandidate && gameCandidate.getRomsWithFiles().length !== expectedCount) {
+        // The found ReleaseCandidate is incomplete
+        DATStatus.pushValueIntoMap(this.incompleteRomTypesToCandidates, game, gameCandidate);
+        continue;
+      }
+
+      // The found ReleaseCandidate is complete
+      DATStatus.pushValueIntoMap(this.foundRomTypesToCandidates, game, gameCandidate);
     }
 
     // Patched ROMs
@@ -197,7 +212,7 @@ export default class DATStatus {
   }
 
   /**
-   * Return the file contents of a CSV with status information for every {@link Game}.
+   * Return a string of CSV rows without headers with status information for every {@link Game}.
    */
   async toCsv(options: Options): Promise<string> {
     const foundCandidates = DATStatus.getValuesForAllowedTypes(
@@ -260,27 +275,15 @@ export default class DATStatus {
           game.isBad(),
         );
       });
-    return await writeToString(rows, {
-      headers: [
-        'DAT Name',
-        'Game Name',
-        'Status',
-        'ROM Files',
-        'Patched',
-        'BIOS',
-        'Retail Release',
-        'Unlicensed',
-        'Debug',
-        'Demo',
-        'Beta',
-        'Sample',
-        'Prototype',
-        'Program',
-        'Aftermarket',
-        'Homebrew',
-        'Bad',
-      ],
-    });
+    return await writeToString(rows);
+  }
+
+  /**
+   * Return a string of the CSV header row that precedes rows from {@link toCsv} and
+   * {@link filesToCsv}.
+   */
+  static async getCsvHeader(): Promise<string> {
+    return await writeToString([CSV_HEADERS]);
   }
 
   /**
@@ -348,9 +351,9 @@ export default class DATStatus {
 
   private static getAllowedTypes(options: Options): ROMTypeValue[] {
     return [
-      !options.getOnlyBios() && !options.getOnlyDevice() && !options.getOnlyRetail()
-        ? ROMType.GAME
-        : undefined,
+      options.getOnlyBios() || options.getOnlyDevice() || options.getOnlyRetail()
+        ? undefined
+        : ROMType.GAME,
       options.getOnlyBios() || (!options.getNoBios() && !options.getOnlyDevice())
         ? ROMType.BIOS
         : undefined,

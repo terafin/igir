@@ -1,5 +1,7 @@
+import os from 'node:os';
 import path from 'node:path';
 
+import CandidateWriterSemaphore from '../../src/async/candidateWriterSemaphore.js';
 import Temp from '../../src/globals/temp.js';
 import Game from '../../src/models/dats/game.js';
 import Header from '../../src/models/dats/logiqx/header.js';
@@ -13,6 +15,7 @@ import ROMWithFiles from '../../src/models/romWithFiles.js';
 import WriteCandidate from '../../src/models/writeCandidate.js';
 import ReportGenerator from '../../src/modules/reportGenerator.js';
 import FsUtil from '../../src/utils/fsUtil.js';
+import PathUtil from '../../src/utils/pathUtil.js';
 import ProgressBarFake from '../console/progressBarFake.js';
 
 /**
@@ -107,11 +110,11 @@ async function wrapReportGenerator(
     reportOutput,
   });
 
-  await new ReportGenerator(options, new ProgressBarFake()).generate(
-    romFiles,
-    cleanedOutputFiles,
-    datStatuses,
-  );
+  await new ReportGenerator(
+    options,
+    new ProgressBarFake(),
+    new CandidateWriterSemaphore(os.availableParallelism()),
+  ).generate(romFiles, cleanedOutputFiles, datStatuses);
 
   try {
     const contents = (await FsUtil.readFile(reportOutput)).toString();
@@ -127,11 +130,40 @@ it('should return empty contents for an empty DAT', async () => {
   });
 });
 
+it('should return a header and one row for every unused file with no DATs', async () => {
+  await wrapReportGenerator(
+    new Options(),
+    [await File.fileOf({ filePath: 'One.rom', size: 123, crc32: 'abcdef01' })],
+    [],
+    [],
+    (contents) => {
+      expect(contents)
+        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
+,,UNUSED,${PathUtil.resolve('One.rom')},false,false,false,false,false,false,false,false,false,false,false,false,false`);
+    },
+  );
+});
+
+it('should return a header and one row for every unused and cleaned file in an empty DAT', async () => {
+  await wrapReportGenerator(
+    new Options(),
+    [await File.fileOf({ filePath: 'One.rom', size: 123, crc32: 'abcdef01' })],
+    ['Two.rom'],
+    [datStatusEmpty],
+    (contents) => {
+      expect(contents)
+        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
+,,UNUSED,${PathUtil.resolve('One.rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
+,,DELETED,Two.rom,false,false,false,false,false,false,false,false,false,false,false,false,false`);
+    },
+  );
+});
+
 it('should return one row for every game in a single game DAT', async () => {
   await wrapReportGenerator(new Options(), [], [], [await buildDatStatusSingle()], (contents) => {
     expect(contents)
       .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-Single,One,FOUND,${path.resolve('One.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false`);
+Single,One,FOUND,${PathUtil.resolve('One.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false`);
   });
 });
 
@@ -140,9 +172,9 @@ it('should return one row for every game in a multiple game DAT', async () => {
     expect(contents)
       .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
 Multiple,Five,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Four,FOUND,${path.resolve('Four.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Three,FOUND,${path.resolve('Three.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Two,FOUND,${path.resolve('Two.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false`);
+Multiple,Four,FOUND,${PathUtil.resolve('Four.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+Multiple,Three,FOUND,${PathUtil.resolve('Three.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+Multiple,Two,FOUND,${PathUtil.resolve('Two.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false`);
   });
 });
 
@@ -165,14 +197,14 @@ it('should return one row for every duplicate and unused file in a multiple game
       expect(contents)
         .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
 Multiple,Five,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Four,FOUND,${path.resolve('Four.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Three,FOUND,${path.resolve('Three.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Two,FOUND,${path.resolve('Two.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-,,DUPLICATE,${path.resolve('Four (Duplicate).rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
-,,DUPLICATE,${path.resolve('Two (Duplicate).rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
-,,UNUSED,${path.resolve('Five.rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
-,,UNUSED,${path.resolve('One (Duplicate).rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
-,,UNUSED,${path.resolve('One.rom')},false,false,false,false,false,false,false,false,false,false,false,false,false`);
+Multiple,Four,FOUND,${PathUtil.resolve('Four.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+Multiple,Three,FOUND,${PathUtil.resolve('Three.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+Multiple,Two,FOUND,${PathUtil.resolve('Two.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+,,DUPLICATE,${PathUtil.resolve('Four (Duplicate).rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
+,,DUPLICATE,${PathUtil.resolve('Two (Duplicate).rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
+,,UNUSED,${PathUtil.resolve('Five.rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
+,,UNUSED,${PathUtil.resolve('One (Duplicate).rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
+,,UNUSED,${PathUtil.resolve('One.rom')},false,false,false,false,false,false,false,false,false,false,false,false,false`);
     },
   );
 });
@@ -190,10 +222,10 @@ it('should return one row for every cleaned file in a multiple game DAT', async 
       expect(contents)
         .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
 Multiple,Five,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Four,FOUND,${path.resolve('Four.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Three,FOUND,${path.resolve('Three.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Two,FOUND,${path.resolve('Two.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-,,UNUSED,${path.resolve('One.rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
+Multiple,Four,FOUND,${PathUtil.resolve('Four.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+Multiple,Three,FOUND,${PathUtil.resolve('Three.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+Multiple,Two,FOUND,${PathUtil.resolve('Two.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+,,UNUSED,${PathUtil.resolve('One.rom')},false,false,false,false,false,false,false,false,false,false,false,false,false
 ,,DELETED,Three.rom,false,false,false,false,false,false,false,false,false,false,false,false,false
 ,,DELETED,Four.rom,false,false,false,false,false,false,false,false,false,false,false,false,false`);
     },
@@ -210,10 +242,10 @@ it('should return one row for every game in multiple DATs', async () => {
       expect(contents)
         .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
 Multiple,Five,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Four,FOUND,${path.resolve('Four.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Three,FOUND,${path.resolve('Three.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-Multiple,Two,FOUND,${path.resolve('Two.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
-Single,One,FOUND,${path.resolve('One.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false`);
+Multiple,Four,FOUND,${PathUtil.resolve('Four.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+Multiple,Three,FOUND,${PathUtil.resolve('Three.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+Multiple,Two,FOUND,${PathUtil.resolve('Two.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+Single,One,FOUND,${PathUtil.resolve('One.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false`);
     },
   );
 });

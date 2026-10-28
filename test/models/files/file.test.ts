@@ -5,14 +5,15 @@ import path from 'node:path';
 import MappableSemaphore from '../../../src/async/mappableSemaphore.js';
 import FileCache from '../../../src/cache/fileCache.js';
 import FileFactory from '../../../src/factories/fileFactory.js';
+import Defaults from '../../../src/globals/defaults.js';
 import Temp from '../../../src/globals/temp.js';
 import ArchiveEntry from '../../../src/models/files/archives/archiveEntry.js';
 import ArchiveFile from '../../../src/models/files/archives/archiveFile.js';
 import Zip from '../../../src/models/files/archives/zip.js';
 import File from '../../../src/models/files/file.js';
 import { ChecksumBitmask } from '../../../src/models/files/fileChecksums.js';
+import FileSignature from '../../../src/models/files/fileSignature.js';
 import IOFile from '../../../src/models/files/ioFile.js';
-import ROMHeader from '../../../src/models/files/romHeader.js';
 import ROMPadding from '../../../src/models/files/romPadding.js';
 import Options from '../../../src/models/options.js';
 import IPSPatch from '../../../src/models/patches/ipsPatch.js';
@@ -20,6 +21,7 @@ import ROMScanner from '../../../src/modules/roms/romScanner.js';
 import bufferUtil from '../../../src/utils/bufferUtil.js';
 import BufferUtil from '../../../src/utils/bufferUtil.js';
 import FsUtil from '../../../src/utils/fsUtil.js';
+import PathUtil from '../../../src/utils/pathUtil.js';
 import ProgressBarFake from '../../console/progressBarFake.js';
 
 describe('fileOf', () => {
@@ -44,7 +46,7 @@ describe('fileOf', () => {
 describe('getFilePath', () => {
   it('should return an absolute path', async () => {
     const file = await File.fileOf({ filePath: path.join('some', 'path') });
-    expect(file.getFilePath()).toEqual(path.resolve('some', 'path'));
+    expect(file.getFilePath()).toEqual(PathUtil.resolve('some', 'path'));
   });
 });
 
@@ -87,7 +89,7 @@ describe('getSize', () => {
         await (await IOFile.fileOfSize(tempFile, 'r', size)).close(); // touch
 
         const tempLink = await FsUtil.mktemp(path.join(tempDir, 'link'));
-        await FsUtil.symlink(path.resolve(tempFile), tempLink);
+        await FsUtil.symlink(PathUtil.resolve(tempFile), tempLink);
         const fileLink = await File.fileOf({ filePath: tempLink });
 
         expect(fileLink.getSize()).toEqual(size);
@@ -173,7 +175,7 @@ describe('getCrc32WithoutHeader', () => {
   ])(
     'should hash the file without the header when header is given and present in file: %s',
     async (filePath, expectedCrc) => {
-      const header = ROMHeader.headerFromFilename(filePath);
+      const header = FileSignature.romHeaderFromFilename(filePath);
       if (header === undefined) {
         throw new Error(`couldn't get header for: ${filePath}`);
       }
@@ -233,7 +235,7 @@ describe('getMd5WithoutHeader', () => {
   ])(
     'should hash the file without the header when header is given and present in file: %s',
     async (filePath, expectedMd5) => {
-      const header = ROMHeader.headerFromFilename(filePath);
+      const header = FileSignature.romHeaderFromFilename(filePath);
       if (header === undefined) {
         throw new Error(`couldn't get header for: ${filePath}`);
       }
@@ -299,7 +301,7 @@ describe('getSha1WithoutHeader', () => {
   ])(
     'should hash the file without the header when header is given and present in file: %s',
     async (filePath, expectedSha1) => {
-      const header = ROMHeader.headerFromFilename(filePath);
+      const header = FileSignature.romHeaderFromFilename(filePath);
       if (header === undefined) {
         throw new Error(`couldn't get header for: ${filePath}`);
       }
@@ -383,7 +385,7 @@ describe('getSha256WithoutHeader', () => {
   ])(
     'should hash the file without the header when header is given and present in file: %s',
     async (filePath, expectedSha256) => {
-      const header = ROMHeader.headerFromFilename(filePath);
+      const header = FileSignature.romHeaderFromFilename(filePath);
       if (header === undefined) {
         throw new Error(`couldn't get header for: ${filePath}`);
       }
@@ -422,6 +424,46 @@ describe('extractToTempFile', () => {
       });
     }
     await FsUtil.rm(temp, { recursive: true });
+  });
+});
+
+describe('extractToIOFile', () => {
+  it('should read the file in place', async () => {
+    const tempDir = await FsUtil.mkdtemp(Temp.getTempDir());
+    const mktempSpy = vi.spyOn(FsUtil, 'mktemp');
+    try {
+      const filePath = path.join(tempDir, 'input.rom');
+      await FsUtil.writeFile(filePath, Buffer.from('0123456789abcdef', 'hex'));
+      const file = await File.fileOf({ filePath });
+
+      const result = await file.extractToIOFile(async (ioFile) => ({
+        pathLike: ioFile.getPathLike(),
+        contents: (await ioFile.readAt(0, ioFile.getSize())).toString('hex'),
+      }));
+
+      expect(result).toEqual({ pathLike: filePath, contents: '0123456789abcdef' });
+      expect(mktempSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.restoreAllMocks();
+      await FsUtil.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('should close the file even if the callback throws', async () => {
+    const file = await File.fileOf({
+      filePath: path.join('test', 'fixtures', 'roms', 'raw', 'fizzbuzz.nes'),
+    });
+    const closeSpy = vi.spyOn(IOFile.prototype, 'close');
+    try {
+      await expect(
+        file.extractToIOFile(() => {
+          throw new Error('callback failed');
+        }),
+      ).rejects.toThrow('callback failed');
+      expect(closeSpy).toHaveBeenCalledOnce();
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
 
@@ -470,7 +512,7 @@ describe('extractAndTransformToFile', () => {
   });
 });
 
-describe('createTransformedReadStream padding', () => {
+describe('extractAndTransformToStream padding', () => {
   it('returns raw bytes unchanged when paddings is empty', async () => {
     const tempDir = await FsUtil.mkdtemp(Temp.getTempDir());
     try {
@@ -479,7 +521,7 @@ describe('createTransformedReadStream padding', () => {
       await FsUtil.writeFile(tempFilePath, raw);
       const file = await File.fileOf({ filePath: tempFilePath }, ChecksumBitmask.CRC32);
 
-      const bytes = await file.createTransformedReadStream(
+      const bytes = await file.extractAndTransformToStream(
         async (readable) => await BufferUtil.fromReadable(readable),
       );
 
@@ -505,7 +547,7 @@ describe('createTransformedReadStream padding', () => {
       ]);
 
       await expect(
-        file.createTransformedReadStream(
+        file.extractAndTransformToStream(
           async (readable) => await BufferUtil.fromReadable(readable),
         ),
       ).rejects.toThrow(/multiple paddings/i);
@@ -524,7 +566,7 @@ describe('createTransformedReadStream padding', () => {
       const fileWithoutPadding = await fileFactory.fileFrom(tempFilePath, ChecksumBitmask.CRC32);
       const file = fileWithoutPadding.withPaddings([new ROMPadding({ paddedSize: 8, fillByte })]);
 
-      const bytes = await file.createTransformedReadStream(
+      const bytes = await file.extractAndTransformToStream(
         async (readable) => await BufferUtil.fromReadable(readable),
       );
 
@@ -536,7 +578,7 @@ describe('createTransformedReadStream padding', () => {
   });
 });
 
-describe('createReadStream', () => {
+describe('extractToStream', () => {
   it('should do nothing with no archive entry path', async () => {
     const raws = await new ROMScanner(
       new Options({
@@ -550,12 +592,75 @@ describe('createReadStream', () => {
 
     const temp = await FsUtil.mkdtemp(Temp.getTempDir());
     for (const raw of raws) {
-      await raw.createReadStream(async (readable) => {
+      await raw.extractToStream(async (readable) => {
         const contents = (await bufferUtil.fromReadable(readable)).toString();
         expect(contents).toBeTruthy();
       });
     }
     await FsUtil.rm(temp, { recursive: true });
+  });
+
+  it('should read no more than the file size at a time', async () => {
+    const file = await File.fileOf({ filePath: './test/fixtures/roms/raw/trimmed.3ds' });
+
+    const highWaterMark = await file.extractToStream((readable) => readable.readableHighWaterMark);
+
+    expect(highWaterMark).toEqual(520);
+  });
+});
+
+describe('readFirstBytes', () => {
+  const filePath = './test/fixtures/roms/raw/trimmed.3ds';
+
+  test.each([0, 1, 16, 520, 1024])('should read the leading %s bytes', async (byteCount) => {
+    const file = await File.fileOf({ filePath });
+
+    const firstBytes = await file.readFirstBytes(byteCount);
+
+    expect(firstBytes).toEqual((await fs.promises.readFile(filePath)).subarray(0, byteCount));
+  });
+});
+
+describe('streamFilePath', () => {
+  const filePath = './test/fixtures/roms/raw/trimmed.3ds';
+
+  it.each([
+    ['no size', undefined, undefined, undefined, Defaults.FILE_READING_CHUNK_SIZE],
+    ['a placeholder size', 0, undefined, undefined, Defaults.FILE_READING_CHUNK_SIZE],
+    ['the file size', 520, undefined, undefined, 520],
+    ['the file size and a start', 520, 100, undefined, 420],
+    ['the file size and an end', 520, 0, 99, 100],
+  ])(
+    'should pick the highWaterMark for %s',
+    async (
+      _,
+      size: number | undefined,
+      start: number | undefined,
+      end: number | undefined,
+      expected,
+    ) => {
+      const highWaterMark = await File.streamFilePath(
+        filePath,
+        (readable) => readable.readableHighWaterMark,
+        size,
+        start,
+        end,
+      );
+
+      expect(highWaterMark).toEqual(expected);
+    },
+  );
+});
+
+describe('getLocationKey', () => {
+  it('should return the file path', async () => {
+    const file = await File.fileOf({ filePath: 'file.rom' });
+    expect(file.getLocationKey()).toEqual(PathUtil.resolve('file.rom'));
+  });
+
+  it('should ignore the symlink source', async () => {
+    const file = await File.fileOf({ filePath: 'file.rom', symlinkSource: 'source.rom' });
+    expect(file.getLocationKey()).toEqual(PathUtil.resolve('file.rom'));
   });
 });
 
@@ -614,5 +719,52 @@ describe('equals', () => {
     const archiveFile = new ArchiveFile(entry, {});
 
     expect(file.equals(archiveFile)).toEqual(true);
+  });
+
+  it('should equal the same file with a different symlink source', async () => {
+    const first = await File.fileOf({ filePath: 'file.rom' });
+    const second = await File.fileOf({ filePath: 'file.rom', symlinkSource: 'source.rom' });
+    expect(first.equals(second)).toEqual(true);
+    expect(second.equals(first)).toEqual(true);
+  });
+
+  it('should equal the same file with the same patch', async () => {
+    const file = await File.fileOf({ filePath: 'file.rom', size: 0, crc32: '00000000' });
+    const first = file.withPatch(
+      IPSPatch.patchFrom(await File.fileOf({ filePath: 'patch 00000000.ips' })),
+    );
+    const second = file.withPatch(
+      IPSPatch.patchFrom(await File.fileOf({ filePath: 'patch 00000000.ips' })),
+    );
+    expect(first.equals(second)).toEqual(true);
+    expect(second.equals(first)).toEqual(true);
+  });
+
+  it('should not equal the same file with a different patch', async () => {
+    const file = await File.fileOf({ filePath: 'file.rom', size: 0, crc32: '00000000' });
+    const first = file.withPatch(
+      IPSPatch.patchFrom(
+        await File.fileOf({ filePath: 'first 00000000.ips', size: 1, crc32: '11111111' }),
+      ),
+    );
+    const second = file.withPatch(
+      IPSPatch.patchFrom(
+        await File.fileOf({ filePath: 'second 00000000.ips', size: 1, crc32: '22222222' }),
+      ),
+    );
+    expect(file.equals(first)).toEqual(false);
+    expect(first.equals(file)).toEqual(false);
+    expect(first.equals(second)).toEqual(false);
+    expect(second.equals(first)).toEqual(false);
+  });
+
+  it('should not equal an ArchiveEntry', async () => {
+    const file = await File.fileOf({ filePath: 'file.zip' });
+    const entry = await ArchiveEntry.entryOf({
+      archive: new Zip('file.zip'),
+      entryPath: 'entry.rom',
+    });
+    expect(file.equals(entry)).toEqual(false);
+    expect(entry.equals(file)).toEqual(false);
   });
 });

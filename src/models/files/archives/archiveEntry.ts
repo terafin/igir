@@ -1,20 +1,28 @@
 import stream from 'node:stream';
 
-import { Exclude, Expose, instanceToPlain, plainToClassFromExist } from 'class-transformer';
+import {
+  Exclude,
+  Expose,
+  instanceToPlain,
+  plainToClassFromExist,
+  Transform,
+} from 'class-transformer';
 
+import IgirException from '../../../exceptions/igirException.js';
 import { FsReadCallback } from '../../../streams/fsReadTransform.js';
-import SkipBytesTransform from '../../../streams/skipBytesTransform.js';
 import FsUtil from '../../../utils/fsUtil.js';
 import Patch from '../../patches/patch.js';
 import File, { FileProps } from '../file.js';
 import FileChecksums, { ChecksumBitmask, ChecksumPropsWithSize } from '../fileChecksums.js';
+import type IOFile from '../ioFile.js';
 import ROMHeader from '../romHeader.js';
 import ROMPadding from '../romPadding.js';
+import type { ArchiveEntryRef } from './archive.js';
 import Archive from './archive.js';
 
-export interface ArchiveEntryProps<A extends Archive> extends Omit<FileProps, 'filePath'> {
+export interface ArchiveEntryProps<A extends Archive>
+  extends Omit<FileProps, 'filePath'>, ArchiveEntryRef {
   readonly archive: A;
-  readonly entryPath: string;
 }
 
 /**
@@ -25,7 +33,16 @@ export default class ArchiveEntry<A extends Archive> extends File implements Arc
   readonly archive: A;
 
   @Expose()
+  @Transform(({ value }: { value: undefined | string }) => {
+    if (value !== undefined && FsUtil.isPathTraversal(value)) {
+      throw new IgirException(`archive entry path is unsafe for directory traversal: ${value}`);
+    }
+    return value;
+  })
   readonly entryPath: string;
+
+  @Expose()
+  readonly entryIndex?: number;
 
   protected constructor(archiveEntryProps: ArchiveEntryProps<A>) {
     super({
@@ -33,7 +50,13 @@ export default class ArchiveEntry<A extends Archive> extends File implements Arc
       filePath: archiveEntryProps.archive.getFilePath(),
     });
     this.archive = archiveEntryProps.archive;
+    if (FsUtil.isPathTraversal(archiveEntryProps.entryPath)) {
+      throw new IgirException(
+        `archive entry path is unsafe for directory traversal: ${archiveEntryProps.entryPath}`,
+      );
+    }
     this.entryPath = archiveEntryProps.entryPath.replaceAll('\\', '/');
+    this.entryIndex = archiveEntryProps.entryIndex;
   }
 
   /**
@@ -78,7 +101,7 @@ export default class ArchiveEntry<A extends Archive> extends File implements Arc
          */
         const headeredChecksums = await this.calculateEntryChecksums(
           archiveEntryProps.archive,
-          archiveEntryProps.entryPath,
+          archiveEntryProps,
           checksumBitmask,
         );
         finalSize ??= headeredChecksums.size;
@@ -90,7 +113,7 @@ export default class ArchiveEntry<A extends Archive> extends File implements Arc
       if (archiveEntryProps.fileHeader && checksumBitmask) {
         const headerlessChecksums = await this.calculateEntryChecksums(
           archiveEntryProps.archive,
-          archiveEntryProps.entryPath,
+          archiveEntryProps,
           checksumBitmask,
           archiveEntryProps.fileHeader,
         );
@@ -126,6 +149,7 @@ export default class ArchiveEntry<A extends Archive> extends File implements Arc
       patch: archiveEntryProps.patch,
       archive: archiveEntryProps.archive,
       entryPath: archiveEntryProps.entryPath,
+      entryIndex: archiveEntryProps.entryIndex,
     });
   }
 
@@ -185,28 +209,30 @@ export default class ArchiveEntry<A extends Archive> extends File implements Arc
   }
 
   /**
+   * Return a key that uniquely identifies where this archive entry is or will be located on disk.
+   */
+  override getLocationKey(): string {
+    return `${this.getFilePath()}|${this.getEntryPath()}`;
+  }
+
+  /**
    * Extract this entry from its archive to the given file path.
    */
   override async extractToFile(
     extractedFilePath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await ArchiveEntry.extractEntryToFile(
-      this.getArchive(),
-      this.getEntryPath(),
-      extractedFilePath,
-      callback,
-    );
+    await ArchiveEntry.extractEntryToFile(this.getArchive(), this, extractedFilePath, callback);
   }
 
   private static async calculateEntryChecksums(
     archive: Archive,
-    entryPath: string,
+    entryRef: ArchiveEntryRef,
     checksumBitmask: number,
     fileHeader?: ROMHeader,
   ): Promise<ChecksumPropsWithSize> {
     return await archive.extractEntryToStream(
-      entryPath,
+      entryRef,
       async (readable) => await FileChecksums.hashStream(readable, checksumBitmask),
       fileHeader?.getDataOffsetBytes() ?? 0,
     );
@@ -214,11 +240,11 @@ export default class ArchiveEntry<A extends Archive> extends File implements Arc
 
   private static async extractEntryToFile(
     archive: Archive,
-    entryPath: string,
+    entryRef: ArchiveEntryRef,
     extractedFilePath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await archive.extractEntryToFile(entryPath, extractedFilePath, callback);
+    await archive.extractEntryToFile(entryRef, extractedFilePath, callback);
   }
 
   /**
@@ -226,37 +252,44 @@ export default class ArchiveEntry<A extends Archive> extends File implements Arc
    * clean up the file.
    */
   override async extractToTempFile<T>(callback: (tempFile: string) => T | Promise<T>): Promise<T> {
-    return await ArchiveEntry.extractEntryToTempFile(
-      this.getArchive(),
-      this.getEntryPath(),
-      callback,
+    return await ArchiveEntry.extractEntryToTempFile(this.getArchive(), this, callback);
+  }
+
+  /**
+   * Extract this entry to a temporary file, open it read-only as an {@link IOFile}, invoke the
+   * callback with it, then close and clean up the file.
+   */
+  override async extractToIOFile<T>(callback: (ioFile: IOFile) => T | Promise<T>): Promise<T> {
+    return await this.extractToTempFile(
+      async (tempFile) => await File.readWithIOFile(tempFile, callback),
     );
   }
 
   private static async extractEntryToTempFile<T>(
     archive: Archive,
-    entryPath: string,
+    entryRef: ArchiveEntryRef,
     callback: (tempFile: string) => T | Promise<T>,
   ): Promise<T> {
-    return await archive.extractEntryToTempFile(entryPath, callback);
+    return await archive.extractEntryToTempFile(entryRef, callback);
   }
 
   /**
-   * Invoke the callback with a readable stream of this entry's bytes, optionally starting at a
-   * byte offset.
+   * Invoke the callback with a readable stream of this entry's bytes, from the {@link start} byte
+   * offset to the end of the entry.
    */
-  override async createReadStream<T>(
+  override async extractToStream<T>(
     callback: (readable: stream.Readable) => T | Promise<T>,
     start = 0,
   ): Promise<T> {
-    if (start > 0) {
-      return await this.archive.extractEntryToStream(
-        this.getEntryPath(),
-        async (readable) => await callback(readable.pipe(new SkipBytesTransform(start))),
-      );
-    }
+    return await this.archive.extractEntryToStream(this, callback, start);
+  }
 
-    return await this.archive.extractEntryToStream(this.getEntryPath(), callback);
+  /**
+   * Read this entry's first {@link byteCount} bytes.
+   * @returns those bytes, or fewer if the entry is shorter
+   */
+  override async readFirstBytes(byteCount: number): Promise<Buffer> {
+    return await this.archive.readEntryFirstBytes(this, byteCount);
   }
 
   override withProps(props: ArchiveEntryProps<A>): ArchiveEntry<A> {
@@ -340,7 +373,8 @@ export default class ArchiveEntry<A extends Archive> extends File implements Arc
   }
 
   /**
-   * Return a human-readable identifier for this archive entry.
+   * Return a human-readable identifier for this archive entry. This is NOT suitable for any kind of
+   * comparison or de-duplication of files.
    */
   override toString(): string {
     if (this.getSymlinkSource()) {

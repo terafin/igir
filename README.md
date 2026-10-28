@@ -61,7 +61,7 @@ $ igir --help
  @@      @@  @@      @@      @@         @@   ROM collection manager
    @@@@@@   @@         @@@@@@   @@@@@@@@@    https://igir.io/
           @@@     @@@@        @@@
-     @@   @@        @@   @@   @@       @@    v5.4.0 (Node.js v26.4.0)
+     @@   @@        @@   @@   @@       @@    v5.8.0 (Node.js v26.12.0)
      @@   @@        @@   @@   @@       @@
      @@   @@@@@@@@@@@@   @@   @@       @@
 
@@ -74,7 +74,8 @@ Commands (can specify multiple):
   igir extract   Extract ROM files in archives when copying or moving
   igir zip       Create zip archives of ROMs when copying or moving
   igir playlist  Create playlist files for multi-disc games
-  igir test      Test ROMs for accuracy after writing them to the output directory
+  igir test      Test ROMs for accuracy after writing them, or test input files if no write
+                 command is given
   igir dir2dat   Generate a DAT from all input files
   igir fixdat    Generate a fixdat of any missing games for every DAT processed (requires
                  --dat)
@@ -115,8 +116,8 @@ DAT input options:
 
 Patch input options:
   -p, --patch          Path(s) to ROM patch files or archives (supports globbing) (supported:
-                       .aps, .bps, .dps, .ebp, .ips, .ips32, .ppf, .rup, .ups, .vcdiff,
-                       .xdelta)                                                        [array]
+                       .aps, .bdf, .bps, .bsdiff, .dps, .ebp, .ips, .ips32, .mod, .ppf, .rup,
+                       .ups, .vcdiff, .xdelta)                                         [array]
   -P, --patch-exclude  Path(s) to ROM patch files or archives to exclude from processing
                        (supports globbing)                                             [array]
       --patch-only     Only write patched ROMs to the output directory               [boolean]
@@ -297,8 +298,11 @@ Help & debug options:
 Advanced usage:
 
   Tokens that are replaced when generating the output (--output) path of a ROM:
+    {datFileName}     The filename of the DAT that contains the ROM, without extension
     {datName}         The name of the DAT that contains the ROM (e.g. "Nintendo - Game Boy")
     {datDescription}  The description of the DAT that contains the ROM
+    {datVersion}      The version of the DAT that contains the ROM
+    {datDate}         The date of the DAT that contains the ROM
     {region}          The region of the ROM release (e.g. "USA"), each ROM can have multiple
     {language}        The language of the ROM release (e.g. "En"), each ROM can have multiple
     {type}            The type of the game (e.g. "Retail", "Demo", "Prototype")
@@ -326,6 +330,8 @@ Advanced usage:
     "gb")
     {retrodeck} The ROM's emulator-specific /roms/* directory for the 'RetroDECK' image (e.g.
     "gb")
+    {retronas}  The ROM's system-specific /roms/* directory for RetroNAS (e.g.
+    "nintendo/gameboy")
     {rocknix}   The ROM's emulator-specific /roms/* directory for ROCKNIX (e.g. "gb")
     {romm}      The ROM's manager-specific /roms/* directory for 'RomM' (e.g. "gb")
     {spruce}    The ROM's emulator-specific /Roms/* directory for SpruceOS (e.g. "GB")

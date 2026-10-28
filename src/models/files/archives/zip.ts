@@ -5,7 +5,12 @@ import stream from 'node:stream';
 
 import async from 'async';
 
-import { CompressionMethod, TZWriter } from '../../../../packages/torrentzip/index.js';
+import sevenZip, { SevenZipFormat } from '../../../../addons/7zip/index.js';
+import {
+  CompressionMethod,
+  tzFileNameComparator,
+  TZWriter,
+} from '../../../../packages/torrentzip/index.js';
 import type { CentralDirectoryFileHeader } from '../../../../packages/zip/index.js';
 import { ZipReader } from '../../../../packages/zip/index.js';
 import { logger } from '../../../console/logger.js';
@@ -14,18 +19,18 @@ import IgirException from '../../../exceptions/igirException.js';
 import Defaults from '../../../globals/defaults.js';
 import type { FsReadCallback } from '../../../streams/fsReadTransform.js';
 import FsReadTransform from '../../../streams/fsReadTransform.js';
-import SkipBytesTransform from '../../../streams/skipBytesTransform.js';
 import FsUtil from '../../../utils/fsUtil.js';
 import type { ZipFormatValue } from '../../options.js';
 import { ZipFormat } from '../../options.js';
 import type File from '../file.js';
 import type { ChecksumProps } from '../fileChecksums.js';
 import FileChecksums, { ChecksumBitmask } from '../fileChecksums.js';
+import type { ArchiveEntryRef } from './archive.js';
 import Archive from './archive.js';
 import ArchiveEntry from './archiveEntry.js';
 
 /**
- * A ZIP archive (including variants like .apk, .ipa, .jar, .pk3).
+ * A ZIP archive (including variants like .apk, .ipa, .jar, .pk3, .vpk).
  */
 export default class Zip extends Archive {
   private readonly zipReader: ZipReader;
@@ -43,11 +48,11 @@ export default class Zip extends Archive {
   }
 
   static getExtensions(): string[] {
-    return ['.zip', '.zip64', '.apk', '.ipa', '.jar', '.pk3'];
+    return ['.zip', '.zip64', '.zipx', '.apk', '.ipa', '.jar', '.pk3', '.vpk'];
   }
 
-  getExtension(): string {
-    return Zip.getExtensions()[0];
+  getExtensions(): string[] {
+    return Zip.getExtensions();
   }
 
   /**
@@ -89,7 +94,7 @@ export default class Zip extends Archive {
           checksumBitmask & ~ChecksumBitmask.CRC32 ||
           (shouldForceChecksumCalculation && checksumBitmask & ChecksumBitmask.CRC32)
         ) {
-          const entryStream = await entryFile.uncompressedStream(Defaults.FILE_READING_CHUNK_SIZE);
+          const entryStream = await this.uncompressedStream(entryFile);
           let lastProgress = 0;
           try {
             checksums = await FileChecksums.hashStream(entryStream, checksumBitmask, (progress) => {
@@ -101,6 +106,12 @@ export default class Zip extends Archive {
             });
           } finally {
             entryStream.destroy();
+          }
+        } else {
+          // The central directory's CRC32 is used, so there's nothing to read
+          overallProgress += entryFile.uncompressedSizeResolved();
+          if (callback) {
+            callback(overallProgress);
           }
         }
         const { crc32, ...checksumsWithoutCrc } = checksums;
@@ -129,7 +140,7 @@ export default class Zip extends Archive {
    * Extract the named entry from the ZIP to the given file path.
    */
   async extractEntryToFile(
-    entryPath: string,
+    entryRef: ArchiveEntryRef,
     extractedFilePath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
@@ -138,7 +149,7 @@ export default class Zip extends Archive {
       await FsUtil.mkdir(extractedDir, { recursive: true });
     }
 
-    await this.extractEntryToStream(entryPath, async (readable) => {
+    await this.extractEntryToStream(entryRef, async (readable) => {
       const writeStream = fs.createWriteStream(extractedFilePath);
       if (callback) {
         await stream.promises.pipeline(readable, new FsReadTransform(callback), writeStream);
@@ -151,10 +162,10 @@ export default class Zip extends Archive {
   /**
    * Invoke the callback with a readable stream of the named entry's uncompressed bytes.
    */
-  override async extractEntryToStream<T>(
-    entryPath: string,
-    callback: (readable: Readable) => Promise<T> | T,
-    start = 0,
+  protected override async streamEntry<T>(
+    { entryPath }: ArchiveEntryRef,
+    callback: (source: Readable) => Promise<T>,
+    byteCount?: number,
   ): Promise<T> {
     // TODO(cemmer): hold a reference to the CentralDirectoryFileHeader so we don't have to parse
     const entries = await this.zipReader.centralDirectoryFileHeaders();
@@ -167,23 +178,40 @@ export default class Zip extends Archive {
       throw new IgirException(`didn't find entry '${entryPath}'`);
     }
 
-    let entryStream: stream.Readable;
+    let sourceStream: stream.Readable;
     try {
-      entryStream = await entry.uncompressedStream(Defaults.FILE_READING_CHUNK_SIZE);
+      sourceStream = await this.uncompressedStream(entry, byteCount);
     } catch (error) {
       throw new Error(`failed to read '${this.getFilePath()}|${entryPath}': ${error}`, {
         cause: error,
       });
     }
-    if (start > 0) {
-      entryStream = entryStream.pipe(new SkipBytesTransform(start));
-    }
+    return await callback(sourceStream);
+  }
 
-    try {
-      return await callback(entryStream);
-    } finally {
-      entryStream.destroy();
+  /**
+   * Open an entry's uncompressed stream with the built-in reader when it supports the entry's
+   * compression method, and with 7-Zip otherwise.
+   */
+  private async uncompressedStream(
+    entry: CentralDirectoryFileHeader,
+    byteCount?: number,
+  ): Promise<Readable> {
+    const highWaterMark = Archive.getStreamChunkSize(entry.uncompressedSizeResolved(), byteCount);
+    if (await entry.canDecompress()) {
+      return await entry.uncompressedStream(highWaterMark);
     }
+    // TODO(cemmer): a name without the UTF-8 flag is decoded as CP437 here, but 7-Zip decodes it
+    //  as UTF-8 (or the OEM code page on Windows), so a non-ASCII name won't be found by 7-Zip.
+    //  For example, the name bytes `Pok\x82mon.bin` are listed by packages/zip as `Pokémon.bin`
+    //  (CP437 0x82 is 'é'), but by addons/7zip as `Pok\uEF82mon.bin` (0x82 isn't valid UTF-8, so
+    //  7-Zip maps it to the private-use code point U+EF82).
+    return sevenZip.openEntryReader({
+      inputFilename: this.getFilePath(),
+      format: SevenZipFormat.ZIP,
+      entryPath: entry.fileNameResolved().replaceAll('\\', '/'),
+      highWaterMark,
+    });
   }
 
   /**
@@ -220,18 +248,10 @@ export default class Zip extends Archive {
     compressorThreads: number,
     callback?: ProgressCallback,
   ): Promise<void> {
-    // TZWriter needs files to be sorted by lowercase
-    const inputToOutputSorted = inputToOutput.toSorted(([, outputA], [, outputB]) => {
-      const pathLowerA = outputA.getEntryPath().toLowerCase();
-      const pathLowerB = outputB.getEntryPath().toLowerCase();
-      if (pathLowerA < pathLowerB) {
-        return -1;
-      }
-      if (pathLowerA > pathLowerB) {
-        return 1;
-      }
-      return 0;
-    });
+    // TZWriter needs files to be sorted the same way TZValidator expects to find them
+    const inputToOutputSorted = inputToOutput.toSorted(([, outputA], [, outputB]) =>
+      tzFileNameComparator(outputA.getEntryPath(), outputB.getEntryPath()),
+    );
 
     let sizeWritten = 0;
     const sizeTotal = inputToOutputSorted.reduce((sum, [, output]) => sum + output.getSize(), 0);
@@ -242,7 +262,7 @@ export default class Zip extends Archive {
         let lastProgress = 0;
         await new Promise((resolve, reject) => {
           inputFile
-            .createTransformedReadStream(async (readable) => {
+            .extractAndTransformToStream(async (readable) => {
               readable.on('error', reject);
               await torrentZip.addStream(
                 readable,

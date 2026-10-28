@@ -2,11 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import stream from 'node:stream';
 import url from 'node:url';
+import zlib from 'node:zlib';
 
 import Temp from '../../../src/globals/temp.js';
 import FileChecksums, { ChecksumBitmask } from '../../../src/models/files/fileChecksums.js';
+import BufferUtil from '../../../src/utils/bufferUtil.js';
 import FsUtil, { WalkMode } from '../../../src/utils/fsUtil.js';
 import type { CompressionMethodValue } from '../src/fileRecord.js';
+import { CompressionMethod } from '../src/fileRecord.js';
 import ZipReader from '../src/zipReader.js';
 
 const dirname = url.fileURLToPath(new URL('.', import.meta.url));
@@ -561,6 +564,39 @@ describe('compressedStream', () => {
 });
 
 describe('uncompressedStream', () => {
+  it.each([
+    ['a highWaterMark larger than the entry', 1024 * 1024, 2713],
+    ['a highWaterMark smaller than the entry', 1024, 1024],
+    ['no highWaterMark', undefined, undefined],
+  ])(
+    'should size the decompressor to the entry for %s',
+    async (_, highWaterMark: number | undefined, expected: number | undefined) => {
+      const zip = new ZipReader(path.join(dirname, 'unzipper', 'compressed-standard-archive.zip'));
+      const entry = (await zip.centralDirectoryFileHeaders()).find(
+        (header) => header.fileNameResolved() === 'file.txt',
+      );
+      if (entry === undefined) {
+        throw new Error("didn't find the fixture's entry");
+      }
+      const chunkSizes: unknown[] = [];
+      const createInflateRaw = zlib.createInflateRaw.bind(zlib);
+      vi.spyOn(zlib, 'createInflateRaw').mockImplementation((options) => {
+        chunkSizes.push(options?.chunkSize);
+        return createInflateRaw(options);
+      });
+      try {
+        const contents = await BufferUtil.fromReadable(
+          await entry.uncompressedStream(highWaterMark),
+        );
+
+        expect(chunkSizes).toEqual([expected]);
+        expect(contents.length).toEqual(2712);
+      } finally {
+        vi.restoreAllMocks();
+      }
+    },
+  );
+
   test.each(fixtures)('%s', async (filePath) => {
     const zip = new ZipReader(filePath);
     const entries = await zip.centralDirectoryFileHeaders();
@@ -600,4 +636,55 @@ describe('uncompressedStream', () => {
       }
     }
   });
+});
+
+describe('canDecompress', () => {
+  const fourFileFixtures = path.join(
+    dirname,
+    '..',
+    '..',
+    '..',
+    'addons',
+    '7zip',
+    'test',
+    'fixtures',
+    'four-small-files',
+  );
+
+  test.each([
+    ['zip-store.zip', CompressionMethod.STORE, true],
+    ['zip-deflate-level9.zip', CompressionMethod.DEFLATE, true],
+    ['zip-zstd-level1.zip', CompressionMethod.ZSTD, true],
+    ['zip-deflate64-level9.zip', CompressionMethod.DEFLATE64, false],
+    ['zip-bzip2-level9.zip', CompressionMethod.BZIP2, false],
+    ['zip-lzma-level9.zip', CompressionMethod.LZMA, false],
+    ['zip-xz-level9.zip', CompressionMethod.XZ, false],
+    ['zip-ppmd-level9.zip', CompressionMethod.PPMD, false],
+  ] satisfies [string, CompressionMethodValue, boolean][])(
+    'should decide from the local file header of %s',
+    async (fileName, expectedMethod, expectedCanDecompress) => {
+      const zip = new ZipReader(path.join(fourFileFixtures, fileName));
+      const entries = await zip.centralDirectoryFileHeaders();
+
+      const localMethods = await Promise.all(
+        entries.map(async (entry) => (await entry.localFileHeader()).compressionMethod),
+      );
+      expect(localMethods).toEqual([
+        expectedMethod,
+        expectedMethod,
+        expectedMethod,
+        expectedMethod,
+      ]);
+
+      const decompressible = await Promise.all(
+        entries.map(async (entry) => await entry.canDecompress()),
+      );
+      expect(decompressible).toEqual([
+        expectedCanDecompress,
+        expectedCanDecompress,
+        expectedCanDecompress,
+        expectedCanDecompress,
+      ]);
+    },
+  );
 });

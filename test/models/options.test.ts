@@ -5,6 +5,7 @@ import fg from 'fast-glob';
 import Temp from '../../src/globals/temp.js';
 import Options from '../../src/models/options.js';
 import FsUtil, { WalkMode } from '../../src/utils/fsUtil.js';
+import PathUtil from '../../src/utils/pathUtil.js';
 
 describe('scanPaths', () => {
   test.each([
@@ -147,18 +148,32 @@ describe('scanPaths', () => {
 
 describe('getOutputDirRoot', () => {
   test.each([
-    ['', path.resolve('')],
-    ['.', path.resolve('.')],
-    ['root', path.resolve('root')],
-    ['foo/bar', path.resolve('foo', 'bar')],
-    ['Assets/{pocket}/common/', path.resolve('Assets')],
-    ['games/{mister}/', path.resolve('games')],
-    ['Roms/{onion}/', path.resolve('Roms')],
-    ['roms/{batocera}/', path.resolve('roms')],
-    ['{datName}', path.resolve('')],
-    ['{datDescription}', path.resolve('')],
+    ['', PathUtil.resolve('')],
+    ['.', PathUtil.resolve('.')],
+    ['root', PathUtil.resolve('root')],
+    ['foo/bar', PathUtil.resolve('foo', 'bar')],
+    ['Assets/{pocket}/common/', PathUtil.resolve('Assets')],
+    ['games/{mister}/', PathUtil.resolve('games')],
+    ['Roms/{onion}/', PathUtil.resolve('Roms')],
+    ['roms/{batocera}/', PathUtil.resolve('roms')],
+    ['{datName}', PathUtil.resolve('')],
+    ['{datDescription}', PathUtil.resolve('')],
   ])('should find the root dir: %s', (output, expectedPath) => {
     expect(new Options({ commands: ['copy'], output }).getOutputDirRoot()).toEqual(expectedPath);
+  });
+});
+
+describe('hasOutput', () => {
+  it('should be true when an output dir is given', () => {
+    expect(new Options({ commands: ['report'], output: 'out' }).hasOutput()).toEqual(true);
+  });
+
+  it('should be true for writing commands', () => {
+    expect(new Options({ commands: ['copy'], output: 'out' }).hasOutput()).toEqual(true);
+  });
+
+  it('should be false when no output dir is given', () => {
+    expect(new Options({ commands: ['report'] }).hasOutput()).toEqual(false);
   });
 });
 
@@ -194,4 +209,30 @@ describe('canRemoveHeader', () => {
       expect(options.canRemoveHeader(extension)).toEqual(false);
     },
   );
+});
+
+describe('shouldFixExtension', () => {
+  test.each([
+    // "always" ignores everything else
+    ['always', ['copy'], [], true],
+    ['always', ['copy'], ['dats'], true],
+    ['always', ['dir2dat'], [], true],
+    // "auto" only fixes when there's nothing more trustworthy
+    ['auto', ['copy'], [], true],
+    ['auto', ['copy'], ['dats'], false],
+    ['auto', ['dir2dat'], [], false],
+    // "never" never fixes
+    ['never', ['copy'], [], false],
+    ['never', ['copy'], ['dats'], false],
+    ['never', ['dir2dat'], [], false],
+  ])(
+    'should respect "--fix-extension %s" with commands %s and DATs %s',
+    (fixExtension, commands, dat, expected) => {
+      expect(new Options({ fixExtension, commands, dat }).shouldFixExtension()).toEqual(expected);
+    },
+  );
+
+  it('should not fix when the option is not provided', () => {
+    expect(new Options({ commands: ['copy'] }).shouldFixExtension()).toEqual(false);
+  });
 });

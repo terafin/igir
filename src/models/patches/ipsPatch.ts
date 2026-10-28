@@ -30,8 +30,8 @@ export default class IPSPatch extends Patch {
     outputRomPath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await this.getFile().extractToTempIOFile('r', async (patchFile) => {
-      const header = await patchFile.readNext(5);
+    await this.getFile().extractToIOFile(async (patchIOFile) => {
+      const header = await patchIOFile.readNext(5);
       if (IPSPatch.FILE_SIGNATURES.every((fileSignature) => !header.equals(fileSignature))) {
         throw new IgirException(`IPS patch header is invalid: ${this.getFile().toString()}`);
       }
@@ -43,12 +43,18 @@ export default class IPSPatch extends Patch {
         eofString = 'EEOF';
       }
 
+      // EBP's trailing JSON metadata can't be confused with a truncation value
+      const isTruncatable =
+        header.toString() === 'PATCH' &&
+        !this.getFile().getExtractedFilePath().toLowerCase().endsWith('.ebp');
+
       await IPSPatch.writeOutputFile(
         inputRomFile,
         outputRomPath,
-        patchFile,
+        patchIOFile,
         offsetSize,
         eofString,
+        isTruncatable,
         callback,
       );
     });
@@ -57,51 +63,65 @@ export default class IPSPatch extends Patch {
   private static async writeOutputFile(
     inputRomFile: File,
     outputRomPath: string,
-    patchFile: IOFile,
+    patchIOFile: IOFile,
     offsetSize: number,
     eofString: string,
+    isTruncatable: boolean,
     callback?: FsReadCallback,
   ): Promise<void> {
     await inputRomFile.extractToFile(outputRomPath);
-    const targetFile = await IOFile.fileFrom(outputRomPath, 'r+');
+    const targetIOFile = await IOFile.fileFrom(outputRomPath, 'r+');
 
     try {
-      await this.applyPatch(patchFile, targetFile, offsetSize, eofString, callback);
+      await this.applyPatch(patchIOFile, targetIOFile, offsetSize, eofString, callback);
+      if (isTruncatable) {
+        // An optional 3-byte truncation size can follow "EOF"
+        patchIOFile.skipNext(eofString.length);
+        if (patchIOFile.getSize() - patchIOFile.getPosition() === 3) {
+          const truncateSize = (await patchIOFile.readNext(3)).readUIntBE(0, 3);
+          // The truncation size can only shrink the output, never extend it
+          if (truncateSize < targetIOFile.getSize()) {
+            await targetIOFile.truncate(truncateSize);
+          }
+        }
+      }
     } finally {
-      await targetFile.close();
+      await targetIOFile.close();
     }
   }
 
   private static async applyPatch(
-    patchFile: IOFile,
-    targetFile: IOFile,
+    patchIOFile: IOFile,
+    targetIOFile: IOFile,
     offsetSize: number,
     eofString: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    while (!patchFile.isEOF()) {
-      const offsetPeek = await patchFile.peekNext(eofString.length);
+    while (!patchIOFile.isEOF()) {
+      const offsetPeek = await patchIOFile.peekNext(eofString.length);
       if (offsetPeek.length === 0 || offsetPeek.toString() === eofString) {
         break;
       }
 
-      const offset = (await patchFile.readNext(offsetSize)).readUIntBE(0, offsetSize);
-      const size = (await patchFile.readNext(2)).readUInt16BE();
+      const offset = (await patchIOFile.readNext(offsetSize)).readUIntBE(0, offsetSize);
+      const size = (await patchIOFile.readNext(2)).readUInt16BE();
       let data: Buffer;
       if (size === 0) {
         // Run-length encoding record
-        const rleSize = (await patchFile.readNext(2)).readUInt16BE();
-        data = Buffer.from((await patchFile.readNext(1)).toString('hex').repeat(rleSize), 'hex');
+        const rleSize = (await patchIOFile.readNext(2)).readUInt16BE();
+        const byte = await patchIOFile.readNext(1);
+        data = byte.length > 0 ? Buffer.alloc(rleSize, byte) : byte;
       } else {
         // Standard record
-        data = await patchFile.readNext(size);
+        data = await patchIOFile.readNext(size);
       }
-      await targetFile.writeAt(data, offset);
+      await targetIOFile.writeAt(data, offset);
 
-      if (callback !== undefined) {
-        const progressPercentage = patchFile.getPosition() / patchFile.getSize();
-        callback(Math.floor(progressPercentage * targetFile.getSize()));
+      if (callback === undefined) {
+        continue;
       }
+      const progressPercentage = patchIOFile.getPosition() / patchIOFile.getSize();
+      callback(Math.floor(progressPercentage * targetIOFile.getSize()));
     }
   }
 }

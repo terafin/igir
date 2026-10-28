@@ -5,7 +5,6 @@ import fs from 'node:fs';
 import module from 'node:module';
 import path from 'node:path';
 
-import fg from 'fast-glob';
 import yargs from 'yargs';
 
 import Timer from '../src/async/timer.js';
@@ -14,6 +13,7 @@ import IgirException from '../src/exceptions/igirException.js';
 import Package from '../src/globals/package.js';
 import Temp from '../src/globals/temp.js';
 import FsUtil from '../src/utils/fsUtil.js';
+import PathUtil from '../src/utils/pathUtil.js';
 
 logger.info('========== COMPILING ==========');
 
@@ -33,7 +33,7 @@ const argv = await yargs([])
   })
   .parse(process.argv.slice(2));
 
-const output = path.resolve(argv.output);
+const output = PathUtil.resolve(argv.output);
 logger.info(`Output: '${output}'`);
 if (await FsUtil.exists(output)) {
   await FsUtil.rm(output);
@@ -41,12 +41,7 @@ if (await FsUtil.exists(output)) {
 
 logger.info("Bundling with 'bun build --compile' ...");
 const bunBuildConfig = {
-  entrypoints: [
-    'index.ts',
-    ...(await fg(
-      `node_modules/@emmercm/maxcso-${argv.platform}-${argv.arch}/dist/{maxcso*,*.dylib}`,
-    )),
-  ],
+  entrypoints: ['index.ts'],
   compile: {
     outfile: output,
     target:
@@ -101,6 +96,15 @@ const bunBuildConfig = {
                 .replace('${os.arch()}', argv.arch);
               return allocate(resolved, 'native');
             },
+          );
+
+          // Rewrite addons' WebAssembly `require('...cjs')` fallbacks into a throw so Bun
+          // doesn't bundle their Emscripten glue, which locates its `.wasm` relative to
+          // `__dirname`. The executable always embeds its target's prebuild instead.
+          source = source.replaceAll(
+            /require\(\s*[`'"]([^`'"]+[/\\]wasm[/\\][^`'"]+\.cjs)[`'"]\s*\)/g,
+            (_match, spec: string) =>
+              `(() => { throw new Error(${JSON.stringify(`the WebAssembly build '${spec}' isn't bundled`)}); })()`,
           );
 
           // Detect `const NAME = path.dirname(require.resolve('PKG/package.json'))`
@@ -186,6 +190,7 @@ const bunBuildConfig = {
     },
   ],
 } satisfies Bun.BuildConfig;
+// eslint-disable-next-line unicorn/no-unsafe-json-serialization
 logger.info(JSON.stringify(bunBuildConfig, undefined, 2));
 const result = await Bun.build(bunBuildConfig);
 

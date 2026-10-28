@@ -15,7 +15,6 @@ import type { FileProps } from '../models/files/file.js';
 import File from '../models/files/file.js';
 import FileChecksums, { ChecksumBitmask } from '../models/files/fileChecksums.js';
 import FileSignature from '../models/files/fileSignature.js';
-import ROMHeader from '../models/files/romHeader.js';
 import type { ROMPaddingProps } from '../models/files/romPadding.js';
 import ROMPadding from '../models/files/romPadding.js';
 import type { FsReadCallback } from '../streams/fsReadTransform.js';
@@ -36,7 +35,7 @@ interface CacheValue {
     | FileProps
     // getOrComputeArchiveChecksums()
     | ArchiveEntryProps<Archive>[]
-    // getOrComputeFileHeader(), getOrComputeFileSignature()
+    // getOrComputeFileSignature()
     | string
     | undefined
     // getOrComputeFilePaddings()
@@ -45,8 +44,7 @@ interface CacheValue {
 
 const ValueType = {
   FILE_CHECKSUMS: 'F',
-  ARCHIVE_CHECKSUMS: 'A',
-  ROM_HEADER: 'H',
+  ARCHIVE_CHECKSUMS: 'A2',
   FILE_SIGNATURE: 'S',
   ROM_PADDING: `P${ROMPadding.getKnownFillBytesCount()}`,
   TZ_VALIDATION: 'Z',
@@ -55,8 +53,8 @@ type ValueTypeKey = keyof typeof ValueType;
 type ValueTypeValue = (typeof ValueType)[ValueTypeKey];
 
 /**
- * A persistent cache of file metadata (checksums, archive entries, ROM headers, signatures,
- * paddings, and TorrentZip validation results) keyed by file path or checksum.
+ * A persistent cache of file metadata (checksums, archive entries, signatures, paddings, and
+ * TorrentZip validation results) keyed by file path or checksum.
  */
 export default class FileCache {
   private static readonly VERSION = 6;
@@ -91,7 +89,7 @@ export default class FileCache {
     // Delete keys from old cache versions
     await this.cache.delete(
       new RegExp(
-        `^V(${[...Array.from({ length: FileCache.VERSION }).keys()].slice(1).join('|')})\\|`,
+        `^V(${Array.from({ length: FileCache.VERSION - 1 }, (_, idx) => idx + 1).join('|')})\\|`,
       ),
     );
     // Delete keys from old value types
@@ -134,7 +132,7 @@ export default class FileCache {
         const checksums = await FileChecksums.hashFile(
           filePath,
           checksumBitmask,
-          undefined,
+          stats.size,
           undefined,
           callback,
         );
@@ -288,21 +286,6 @@ export default class FileCache {
     );
   }
 
-  async getOrComputeFileHeader(file: File): Promise<ROMHeader | undefined> {
-    return await this.getOrComputeAny(
-      file,
-      ValueType.ROM_HEADER,
-      ROMHeader.getKnownHeaderCount(),
-      async () => {
-        const header = await file.createReadStream(
-          async (readable) => await ROMHeader.headerFromFileStream(readable),
-        );
-        return header?.getName();
-      },
-      (name) => ROMHeader.headerFromName(name),
-    );
-  }
-
   async getOrComputeFileSignature(
     file: File,
     callback?: FsReadCallback,
@@ -312,9 +295,16 @@ export default class FileCache {
       ValueType.FILE_SIGNATURE,
       FileSignature.SIGNATURES.length,
       async () => {
-        const signature = await file.createReadStream(
-          async (readable) => await FileSignature.signatureFromFileStream(readable, callback),
-        );
+        const byteCount = FileSignature.MAX_HEADER_LENGTH_BYTES;
+        if (callback) {
+          // Only the leading bytes are read, not the whole file
+          callback(0, Math.min(byteCount, file.getSize()));
+        }
+        const fileHeader = await file.readFirstBytes(byteCount);
+        if (callback) {
+          callback(fileHeader.length);
+        }
+        const signature = FileSignature.signatureFromBuffer(fileHeader);
         return signature?.getName();
       },
       (name) => FileSignature.signatureFromName(name),
@@ -322,8 +312,8 @@ export default class FileCache {
   }
 
   /**
-   * Shared logic for caching file header and file signature lookups. Both cache a name string
-   * and reconstruct the object from that name on cache hit.
+   * Shared logic for caching name-based lookups such as file signatures. These cache a name
+   * string and reconstruct the object from that name on cache hit.
    */
   private async getOrComputeAny<T>(
     file: File,

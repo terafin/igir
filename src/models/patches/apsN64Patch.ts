@@ -36,24 +36,24 @@ export default class APSN64Patch extends Patch {
     const crcBefore = super.getCrcFromPath(file.getExtractedFilePath());
     let targetSize = 0;
 
-    await file.extractToTempIOFile('r', async (patchFile) => {
-      patchFile.seek(this.FILE_SIGNATURE.length);
-      patchType = (await patchFile.readNext(1)).readUInt8() as APSN64PatchTypeValue;
-      patchFile.skipNext(1); // encoding method
-      patchFile.skipNext(50); // description
+    await file.extractToIOFile(async (patchIOFile) => {
+      patchIOFile.seek(this.FILE_SIGNATURE.length);
+      patchType = (await patchIOFile.readNext(1)).readUInt8() as APSN64PatchTypeValue;
+      patchIOFile.skipNext(1); // encoding method
+      patchIOFile.skipNext(50); // description
 
       if (patchType === APSN64PatchType.SIMPLE) {
-        targetSize = (await patchFile.readNext(4)).readUInt32LE();
+        targetSize = (await patchIOFile.readNext(4)).readUInt32LE();
       } else if (patchType === APSN64PatchType.N64) {
-        patchFile.skipNext(1); // ROM format
-        patchFile.skipNext(2); // cart ID string (*'s from: NUS-N**X-XXX)
-        patchFile.skipNext(1); // country string (* from: NUS-NXX*-XXX)
-        patchFile.skipNext(8); // CRC within the ROM (NOT the entire ROM CRC)
-        patchFile.skipNext(5); // padding
-        targetSize = (await patchFile.readNext(4)).readUInt32LE();
+        patchIOFile.skipNext(1); // ROM format
+        patchIOFile.skipNext(2); // cart ID string (*'s from: NUS-N**X-XXX)
+        patchIOFile.skipNext(1); // country string (* from: NUS-NXX*-XXX)
+        patchIOFile.skipNext(8); // CRC within the ROM (NOT the entire ROM CRC)
+        patchIOFile.skipNext(5); // padding
+        targetSize = (await patchIOFile.readNext(4)).readUInt32LE();
       } else {
         throw new IgirException(
-          `APS (N64) patch type ${patchType} isn't supported: ${patchFile.getPathLike().toString()}`,
+          `APS (N64) patch type ${patchType} isn't supported: ${patchIOFile.getPathLike().toString()}`,
         );
       }
     });
@@ -69,68 +69,83 @@ export default class APSN64Patch extends Patch {
     outputRomPath: string,
     callback?: FsReadCallback,
   ): Promise<void> {
-    await this.getFile().extractToTempIOFile('r', async (patchFile) => {
-      const header = await patchFile.readNext(APSN64Patch.FILE_SIGNATURE.length);
+    await this.getFile().extractToIOFile(async (patchIOFile) => {
+      const header = await patchIOFile.readNext(APSN64Patch.FILE_SIGNATURE.length);
       if (!header.equals(APSN64Patch.FILE_SIGNATURE)) {
         throw new IgirException(`APS (N64) patch header is invalid: ${this.getFile().toString()}`);
       }
 
-      if (this.patchType === APSN64PatchType.SIMPLE) {
-        patchFile.seek(61);
-      } else if (this.patchType === APSN64PatchType.N64) {
-        patchFile.seek(78);
-      } else {
-        throw new IgirException(
-          `APS (N64) patch type ${this.patchType} isn't supported: ${patchFile.getPathLike().toString()}`,
-        );
-      }
+      // patchFrom() already rejected unsupported patch types
+      patchIOFile.seek(this.patchType === APSN64PatchType.SIMPLE ? 57 : 74);
+      const targetSize = (await patchIOFile.readNext(4)).readUInt32LE();
 
-      await APSN64Patch.writeOutputFile(inputRomFile, outputRomPath, patchFile, callback);
+      await APSN64Patch.writeOutputFile(
+        inputRomFile,
+        outputRomPath,
+        patchIOFile,
+        targetSize,
+        callback,
+      );
     });
   }
 
   private static async writeOutputFile(
     inputRomFile: File,
     outputRomPath: string,
-    patchFile: IOFile,
+    patchIOFile: IOFile,
+    targetSize: number,
     callback?: FsReadCallback,
   ): Promise<void> {
     await inputRomFile.extractToFile(outputRomPath);
-    const targetFile = await IOFile.fileFrom(outputRomPath, 'r+');
+    const targetIOFile = await IOFile.fileFrom(outputRomPath, 'r+');
 
     try {
-      await this.applyPatch(patchFile, targetFile, callback);
+      await this.applyPatch(patchIOFile, targetIOFile, callback);
+      await targetIOFile.truncate(targetSize);
     } finally {
-      await targetFile.close();
+      await targetIOFile.close();
     }
   }
 
   private static async applyPatch(
-    patchFile: IOFile,
-    targetFile: IOFile,
+    patchIOFile: IOFile,
+    targetIOFile: IOFile,
     callback?: FsReadCallback,
   ): Promise<void> {
-    while (patchFile.getPosition() < patchFile.getSize()) {
-      const offset = (await patchFile.readNext(4)).readUInt32LE();
-      const size = (await patchFile.readNext(1)).readUInt8();
+    while (patchIOFile.getPosition() < patchIOFile.getSize()) {
+      const offset = (await this.readRecordBytes(patchIOFile, 4)).readUInt32LE();
+      const size = (await this.readRecordBytes(patchIOFile, 1)).readUInt8();
 
       let data: Buffer;
       if (size === 0) {
         // Run-length encoding record
-        const byte = await patchFile.readNext(1);
-        const rleSize = (await patchFile.readNext(1)).readUInt8();
-        data = Buffer.from(byte.toString('hex').repeat(rleSize), 'hex');
+        const byte = await this.readRecordBytes(patchIOFile, 1);
+        const rleSize = (await this.readRecordBytes(patchIOFile, 1)).readUInt8();
+        data = Buffer.alloc(rleSize, byte);
       } else {
         // Standard record
-        data = await patchFile.readNext(size);
+        data = await this.readRecordBytes(patchIOFile, size);
       }
 
-      await targetFile.writeAt(data, offset);
+      await targetIOFile.writeAt(data, offset);
 
-      if (callback !== undefined) {
-        const progressPercentage = patchFile.getPosition() / patchFile.getSize();
-        callback(Math.floor(progressPercentage * targetFile.getSize()));
-      }
+      callback?.(
+        Math.floor((patchIOFile.getPosition() / patchIOFile.getSize()) * targetIOFile.getSize()),
+      );
     }
+  }
+
+  /**
+   * Read exactly the next {@link size} bytes of a record, throwing if the patch ends first.
+   * @returns the record bytes
+   */
+  private static async readRecordBytes(patchIOFile: IOFile, size: number): Promise<Buffer> {
+    const data = await patchIOFile.readNext(size);
+    if (data.length !== size) {
+      throw new IgirException(
+        `APS (N64) patch is truncated: ${patchIOFile.getPathLike().toString()}`,
+      );
+    }
+    return data;
   }
 }

@@ -10,7 +10,7 @@ import Defaults from '../globals/defaults.js';
 import Package from '../globals/package.js';
 import Internationalization from '../models/dats/internationalization.js';
 import { ChecksumBitmask, ChecksumBitmaskInverted } from '../models/files/fileChecksums.js';
-import ROMHeader from '../models/files/romHeader.js';
+import FileSignature from '../models/files/fileSignature.js';
 import Options, {
   FixExtension,
   FixExtensionInverted,
@@ -37,6 +37,7 @@ import Options, {
 import yargs from '../polyfill/yargsShim.js';
 import ArrayUtil from '../utils/arrayUtil.js';
 import ConsoleUtil from '../utils/consoleUtil.js';
+import PathUtil from '../utils/pathUtil.js';
 
 /**
  * Parse a {@link process.argv} (without its first two arguments, the Node.js executable and the
@@ -116,7 +117,10 @@ export default class ArgumentsParser {
       ['extract', 'Extract ROM files in archives when copying or moving'],
       ['zip', 'Create zip archives of ROMs when copying or moving'],
       ['playlist', 'Create playlist files for multi-disc games'],
-      ['test', 'Test ROMs for accuracy after writing them to the output directory'],
+      [
+        'test',
+        'Test ROMs for accuracy after writing them, or test input files if no write command is given',
+      ],
       ['dir2dat', 'Generate a DAT from all input files'],
       ['fixdat', 'Generate a fixdat of any missing games for every DAT processed (requires --dat)'],
       ['clean', 'Recycle unknown files in the output directory'],
@@ -418,6 +422,10 @@ export default class ArgumentsParser {
           logger.warn(
             "archived files can't be patched unless the 'extract' or 'zip' command is used",
           );
+        } else if (checkArgv.patch && checkArgv['zip-exclude'] !== undefined) {
+          logger.warn(
+            "archived files excluded from zipping by '--zip-exclude <glob>' won't be patched unless the 'extract' command is used instead of 'zip'",
+          );
         }
         return true;
       })
@@ -431,15 +439,17 @@ export default class ArgumentsParser {
         requiresArg: true,
       })
       .middleware((middlewareArgv) => {
-        if (
-          !(middlewareArgv.output && middlewareArgv._.includes('clean') && middlewareArgv.input)
-        ) {
+        if (!(
+          middlewareArgv.output &&
+          middlewareArgv._.includes('clean') &&
+          middlewareArgv.input
+        )) {
           return;
         }
-        const outputResolved = path.resolve(middlewareArgv.output as string);
+        const outputResolved = PathUtil.resolve(middlewareArgv.output as string);
         if (
           middlewareArgv.input.every(
-            (inputPath) => !outputResolved.startsWith(path.resolve(inputPath as string)),
+            (inputPath) => !outputResolved.startsWith(PathUtil.resolve(inputPath as string)),
           )
         ) {
           logger.warn(
@@ -688,7 +698,7 @@ export default class ArgumentsParser {
       .option('remove-headers', {
         group: groupRomHeader,
         alias: 'H',
-        description: `Remove known headers from ROMs, optionally limited to a list of comma-separated file extensions (supported: ${ROMHeader.getSupportedExtensions().join(', ')})`,
+        description: `Remove known headers from ROMs, optionally limited to a list of comma-separated file extensions (supported: ${FileSignature.getROMHeaderExtensions().join(', ')})`,
         type: 'string',
         coerce: (vals: string | string[]) =>
           (Array.isArray(vals) ? vals : [vals]).flatMap((val) => {
@@ -1234,8 +1244,11 @@ export default class ArgumentsParser {
 Advanced usage:
 
   Tokens that are replaced when generating the output (--output) path of a ROM:
+    {datFileName}     The filename of the DAT that contains the ROM, without extension
     {datName}         The name of the DAT that contains the ROM (e.g. "Nintendo - Game Boy")
     {datDescription}  The description of the DAT that contains the ROM
+    {datVersion}      The version of the DAT that contains the ROM
+    {datDate}         The date of the DAT that contains the ROM
     {region}          The region of the ROM release (e.g. "USA"), each ROM can have multiple
     {language}        The language of the ROM release (e.g. "En"), each ROM can have multiple
     {type}            The type of the game (e.g. "Retail", "Demo", "Prototype")
@@ -1258,6 +1271,7 @@ Advanced usage:
     {onion}     The ROM's emulator-specific /Roms/* directory for OnionOS/GarlicOS (e.g. "GB")
     {pocket}    The ROM's core-specific /Assets/* directory for the Analogue Pocket (e.g. "gb")
     {retrodeck} The ROM's emulator-specific /roms/* directory for the 'RetroDECK' image (e.g. "gb")
+    {retronas}  The ROM's system-specific /roms/* directory for RetroNAS (e.g. "nintendo/gameboy")
     {rocknix}   The ROM's emulator-specific /roms/* directory for ROCKNIX (e.g. "gb")
     {romm}      The ROM's manager-specific /roms/* directory for 'RomM' (e.g. "gb")
     {spruce}    The ROM's emulator-specific /Roms/* directory for SpruceOS (e.g. "GB")

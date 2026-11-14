@@ -16,6 +16,7 @@ import noArrayPushSpread from './.eslint/rules/performance/noArrayPushSpread.mjs
 import noArrayRebuildInLoop from './.eslint/rules/performance/noArrayRebuildInLoop.mjs';
 import noArrayShiftMutationInLoop from './.eslint/rules/performance/noArrayShiftMutationInLoop.mjs';
 import noNumberToLocaleString from './.eslint/rules/performance/noNumberToLocaleString.mjs';
+import noPathResolve from './.eslint/rules/performance/noPathResolve.mjs';
 import noFsPromisify from './.eslint/rules/style/noFsPromisify.mjs';
 import noNodeSubpathImports from './.eslint/rules/style/noNodeSubpathImports.mjs';
 import preferNodeDefaultImport from './.eslint/rules/style/preferNodeDefaultImport.mjs';
@@ -25,7 +26,15 @@ const __dirname = path.dirname(__filename);
 
 export default eslintConfig.defineConfig([
   {
-    ignores: ['.*/**', 'dist/**', 'packages/*/deps/**', 'site/**'],
+    ignores: [
+      '.*/**',
+      'addons/*/deps/**',
+      'addons/*/build/**',
+      'addons/*/addon-*/**',
+      'coverage/**',
+      'dist/**',
+      'site/**',
+    ],
   },
 
   // @typescript-eslint
@@ -81,6 +90,7 @@ export default eslintConfig.defineConfig([
           'no-array-rebuild-in-loop': noArrayRebuildInLoop,
           'no-array-shift-mutation-in-loop': noArrayShiftMutationInLoop,
           'no-number-to-locale-string': noNumberToLocaleString,
+          'no-path-resolve': noPathResolve,
         },
       },
     },
@@ -92,6 +102,7 @@ export default eslintConfig.defineConfig([
       'local/no-array-rebuild-in-loop': 'error',
       'local/no-array-shift-mutation-in-loop': 'error',
       'local/no-number-to-locale-string': 'error',
+      'local/no-path-resolve': 'error',
     },
   },
 
@@ -181,6 +192,7 @@ export default eslintConfig.defineConfig([
       'jsdoc/require-param': 'off',
       'jsdoc/require-returns': 'off',
       'jsdoc/no-blank-blocks': 'error',
+      // TODO(cemmer): 'jsdoc/tag-lines': ['error', 'never', { startLines: 1 }],
 
       // ***** Promises *****
 
@@ -190,6 +202,9 @@ export default eslintConfig.defineConfig([
 
       // ***** Operands *****
       eqeqeq: 'error',
+
+      // ***** Control Structures *****
+      curly: ['error', 'all'],
 
       // ***** Conditionals *****
 
@@ -224,16 +239,20 @@ export default eslintConfig.defineConfig([
       'unicorn/max-nested-calls': 'off',
       'unicorn/name-replacements': 'off',
       'unicorn/no-array-reduce': 'off',
+      'unicorn/no-asterisk-prefix-in-documentation-comments': 'off',
       'unicorn/no-await-expression-member': 'off',
       'unicorn/no-break-in-nested-loop': 'off', // unicorn/no-duplicate-loops + unicorn/prefer-continue encourage this
       'unicorn/no-hex-escape': 'off',
+      'unicorn/no-immediate-mutation': 'off', // TODO(cemmer): checkConditionals:true with v76
       'unicorn/no-unreadable-new-expression': 'off',
       'unicorn/no-useless-undefined': 'off',
+      'unicorn/prefer-combined-guards': 'off',
       'unicorn/prefer-simple-condition-first': 'off',
       'unicorn/prefer-string-raw': 'off',
       'unicorn/prefer-switch': 'off',
       'unicorn/prefer-ternary': 'off',
       'unicorn/prefer-type-error': 'off',
+      'unicorn/single-line-block-comment-style': ['error', 'single-line'],
       // Overly broad rules with too many false positives 😡
       'unicorn/no-unsafe-string-replacement': 'off', // doesn't curly braces in regex search
       'unicorn/prefer-await': 'off', // doesn't check if the call site is in an async context
@@ -244,6 +263,14 @@ export default eslintConfig.defineConfig([
       // ***** ESLint:recommended *****
       // Referencing ASCII characters <32 is entirely legitimate
       'no-control-regex': 'off',
+      // Also check the app's own exceptions, and don't let catch blocks discard the caught error
+      'preserve-caught-error': [
+        'error',
+        {
+          requireCatchParameter: true,
+          errorClassNames: ['IgirException', 'TokenReplacementException'],
+        },
+      ],
     },
   },
   {
@@ -299,11 +326,11 @@ export default eslintConfig.defineConfig([
       '@typescript-eslint/no-unused-vars': [
         'error',
         {
-          /*** @ESLint/js defaults ***/
+          // ***** @ESLint/js defaults *****
           vars: 'all',
           caughtErrors: 'all',
           reportUsedIgnorePattern: false,
-          /*** Overrides ***/
+          // ***** Overrides *****
           args: 'all',
           argsIgnorePattern: '^_',
           // Allow the use of destructuring to remove keys from an object
@@ -338,7 +365,7 @@ export default eslintConfig.defineConfig([
 
   // Ignore JSDoc requirements for some files
   {
-    files: ['test/**/*.ts', 'packages/*/test/**/*.ts'],
+    files: ['test/**/*.ts', '{addons,packages}/*/test/**/*.ts'],
     rules: {
       'jsdoc/require-jsdoc': 'off',
     },

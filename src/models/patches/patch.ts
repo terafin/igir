@@ -1,6 +1,8 @@
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 import IgirException from '../../exceptions/igirException.js';
+import Defaults from '../../globals/defaults.js';
 import type IOFile from '../../models/files/ioFile.js';
 import type { FsReadCallback } from '../../streams/fsReadTransform.js';
 import FsUtil from '../../utils/fsUtil.js';
@@ -11,6 +13,9 @@ import type File from '../files/file.js';
  * that identify the source and result ROMs.
  */
 export default abstract class Patch {
+  // Enough bytes, at 7 bits each, for any UPS-style unsigned integer up to Number.MAX_SAFE_INTEGER
+  private static readonly UPS_UINT_READ_AHEAD_SIZE = 8;
+
   private readonly file: File;
 
   private readonly crcBefore: string;
@@ -66,6 +71,19 @@ export default abstract class Patch {
     return `${this.getFile().toString()} (${this.crcBefore} → ${this.crcAfter ?? '????????'}${this.sizeAfter !== undefined && this.sizeAfter > 0 ? `, ${FsUtil.sizeReadable(this.sizeAfter)}` : ''})`;
   }
 
+  /**
+   * A string hash code to uniquely identify this {@link Patch}.
+   */
+  hashCode(): string {
+    return [
+      this.constructor.name,
+      this.getFile().hashCode(),
+      this.crcBefore,
+      this.crcAfter,
+      this.sizeAfter,
+    ].join('|');
+  }
+
   abstract createPatchedFile(
     inputRomFile: File,
     outputRomPath: string,
@@ -73,64 +91,59 @@ export default abstract class Patch {
   ): Promise<void>;
 
   /**
-   * Read a UPS-style variable-length unsigned integer from the given file handle, advancing the
-   * read position past the encoded value.
+   * Read a BSDiff-style 64-bit little-endian sign-magnitude integer from a buffer at the given
+   * offset, where the most significant bit is the sign and the remaining 63 bits are the
+   * magnitude.
    */
-  protected static async readUpsUint(fp: IOFile): Promise<number> {
+  protected static readBsdiffInt(buffer: Buffer, offset: number): number {
+    const magnitude =
+      buffer.readUInt32LE(offset) + (buffer.readUInt32LE(offset + 4) & 0x7f_ff_ff_ff) * 2 ** 32;
+    return buffer.readUInt8(offset + 7) & 0x80 ? -magnitude : magnitude;
+  }
+
+  /**
+   * Calculate the CRC32 of the region [{@link start}, {@link end}) of a file, a chunk at a time.
+   */
+  protected static async crc32Range(ioFile: IOFile, start: number, end: number): Promise<string> {
+    let crc = 0;
+    let position = start;
+    while (position < end) {
+      const chunkSize = Math.min(end - position, Defaults.FILE_READING_CHUNK_SIZE);
+      const chunk = await ioFile.readAt(position, chunkSize);
+      crc = zlib.crc32(chunk, crc);
+      position += chunkSize;
+    }
+    return (crc >>> 0).toString(16).padStart(8, '0');
+  }
+
+  /**
+   * Read a UPS-style variable-length unsigned integer from the given file, advancing the read
+   * position past the encoded value.
+   */
+  protected static async readUpsUint(
+    ioFile: Pick<IOFile, 'peekNext' | 'skipNext'>,
+  ): Promise<number> {
     let data = 0;
     let shift = 1;
 
-    while (!fp.isEOF()) {
-      const x = (await fp.readNext(1)).readUInt8();
-      data += (x & 0x7f) * shift; // drop the left-most bit
-      if (x & 0x80) {
-        // left-most bit is telling us this is the end
-        break;
+    // Read ahead rather than byte-by-byte, encoded values are usually only a few bytes
+    let bytes = await ioFile.peekNext(this.UPS_UINT_READ_AHEAD_SIZE);
+    while (bytes.length > 0) {
+      for (const [i, byte] of bytes.entries()) {
+        data += (byte & 0x7f) * shift; // drop the left-most bit
+        if (byte & 0x80) {
+          // left-most bit is telling us this is the end
+          ioFile.skipNext(i + 1);
+          return data;
+        }
+        // Multiply rather than shift, as bitwise operators only work on 32-bit integers
+        shift *= 128;
+        data += shift;
       }
-      shift <<= 7;
-      data += shift;
+      ioFile.skipNext(bytes.length);
+      bytes = await ioFile.peekNext(this.UPS_UINT_READ_AHEAD_SIZE);
     }
 
     return data;
-  }
-
-  /**
-   * Read a VCDIFF-style variable-length unsigned integer from the given file handle, advancing
-   * the read position past the encoded value.
-   */
-  static async readVcdiffUintFromFile(fp: IOFile): Promise<number> {
-    let num = 0;
-
-    while (!fp.isEOF()) {
-      const bits = (await fp.readNext(1)).readUInt8();
-      num = (num << 7) + (bits & 0x7f);
-      if (!(bits & 0x80)) {
-        // left-most bit is telling us to keep going
-        break;
-      }
-    }
-
-    return num;
-  }
-
-  /**
-   * Read a VCDIFF-style variable-length unsigned integer from a buffer starting at the given
-   * offset, returning the value and the new offset past the encoded bytes.
-   */
-  static readVcdiffUintFromBuffer(buffer: Buffer, offset = 0): [number, number] {
-    let num = 0;
-
-    let lastOffset = offset;
-    while (lastOffset < buffer.length) {
-      const bits = buffer.readUInt8(lastOffset);
-      lastOffset += 1;
-      num = (num << 7) + (bits & 0x7f);
-      if (!(bits & 0x80)) {
-        // left-most bit is telling us to keep going
-        break;
-      }
-    }
-
-    return [num, lastOffset];
   }
 }

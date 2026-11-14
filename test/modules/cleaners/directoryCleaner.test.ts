@@ -1,11 +1,11 @@
 import path from 'node:path';
 
 import Temp from '../../../src/globals/temp.js';
-import File from '../../../src/models/files/file.js';
 import type { OptionsProps } from '../../../src/models/options.js';
 import Options from '../../../src/models/options.js';
 import DirectoryCleaner from '../../../src/modules/cleaners/directoryCleaner.js';
 import FsUtil, { WalkMode } from '../../../src/utils/fsUtil.js';
+import PathUtil from '../../../src/utils/pathUtil.js';
 import ProgressBarFake from '../../console/progressBarFake.js';
 
 const ROM_FIXTURES_DIR = path.join('test', 'fixtures', 'roms');
@@ -32,10 +32,8 @@ async function runOutputCleaner(
   await FsUtil.copyDir(ROM_FIXTURES_DIR, tempInputDir);
 
   try {
-    const writtenRomFilesToExclude = await Promise.all(
-      writtenFilePathsToExclude.map(
-        async (filePath) => await File.fileOf({ filePath: path.join(tempInputDir, filePath) }),
-      ),
+    const writtenRomFilePathsToExclude = writtenFilePathsToExclude.map((filePath) =>
+      PathUtil.resolve(tempInputDir, filePath),
     );
 
     const before = await FsUtil.walk(tempInputDir, WalkMode.FILES);
@@ -49,7 +47,7 @@ async function runOutputCleaner(
           cleanExclude: cleanExclude.map((filePath) => path.join(tempInputDir, filePath)),
         }),
         new ProgressBarFake(),
-      ).clean([tempInputDir], writtenRomFilesToExclude)
+      ).clean([tempInputDir], writtenRomFilePathsToExclude)
     )
       .map((pathLike) => pathLike.replace(tempInputDir + path.sep, ''))
       .toSorted((a, b) => a.localeCompare(b));
@@ -98,6 +96,7 @@ it('should delete some if all unmatched and some excluded', async () => {
   );
   expect(remainingPaths).toEqual([
     path.join('7z', 'foobar.7z'),
+    path.join('bz2', 'foobar.bz2'),
     'foobar.lnx',
     path.join('gz', 'foobar.gz'),
     path.join('rar', 'foobar.rar'),
@@ -191,7 +190,7 @@ it('should delete hard links', async () => {
         commands: ['move', 'clean'],
       }),
       new ProgressBarFake(),
-    ).clean([linksDir], [await File.fileOf({ filePath: tempLinkOne })]);
+    ).clean([linksDir], [PathUtil.resolve(tempLinkOne)]);
 
     const remainingPaths = (await FsUtil.walk(tempDir, WalkMode.FILES)).toSorted((a, b) =>
       a.localeCompare(b),
@@ -231,7 +230,7 @@ it('should delete symlinks', async () => {
         commands: ['move', 'clean'],
       }),
       new ProgressBarFake(),
-    ).clean([linksDir], [await File.fileOf({ filePath: tempLinkOne })]);
+    ).clean([linksDir], [PathUtil.resolve(tempLinkOne)]);
 
     const remainingPaths = (await FsUtil.walk(tempDir, WalkMode.FILES)).toSorted((a, b) =>
       a.localeCompare(b),

@@ -5,6 +5,7 @@ import IgirException from '../../exceptions/igirException.js';
 import FsUtil from '../../utils/fsUtil.js';
 import StreamUtil from '../../utils/streamUtil.js';
 import File from './file.js';
+import IOFile from './ioFile.js';
 
 /**
  * A singleton {@link File} representing an empty (zero-byte) file with precomputed checksums.
@@ -42,11 +43,32 @@ export default class ZeroSizeFile extends File {
   }
 
   /**
+   * Open the null device read-only as an empty {@link IOFile}, invoke the callback with it, then
+   * close it.
+   */
+  override async extractToIOFile<T>(callback: (ioFile: IOFile) => T | Promise<T>): Promise<T> {
+    const ioFile = await IOFile.fileFrom(this.getFilePath(), 'r', this.getSize());
+    try {
+      return await callback(ioFile);
+    } finally {
+      await ioFile.close();
+    }
+  }
+
+  /**
    * Invoke the callback with a readable stream that produces zero bytes.
    */
-  override async createReadStream<T>(callback: (readable: Readable) => Promise<T> | T): Promise<T> {
+  override async extractToStream<T>(callback: (readable: Readable) => Promise<T> | T): Promise<T> {
     const readable = StreamUtil.staticReadable(0, 0x00);
     return await callback(readable);
+  }
+
+  /**
+   * @returns no bytes, because this file has none
+   */
+  // eslint-disable-next-line @typescript-eslint/require-await
+  override async readFirstBytes(): Promise<Buffer> {
+    return Buffer.alloc(0);
   }
 
   override withProps(): File {

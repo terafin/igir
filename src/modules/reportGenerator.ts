@@ -1,5 +1,6 @@
 import path from 'node:path';
 
+import type CandidateWriterSemaphore from '../async/candidateWriterSemaphore.js';
 import type ProgressBar from '../console/progressBar.js';
 import DATStatus, { GameStatus } from '../models/datStatus.js';
 import type File from '../models/files/file.js';
@@ -14,10 +15,16 @@ import Module from './module.js';
  */
 export default class ReportGenerator extends Module {
   private readonly options: Options;
+  private readonly writerSemaphore: CandidateWriterSemaphore;
 
-  constructor(options: Options, progressBar: ProgressBar) {
+  constructor(
+    options: Options,
+    progressBar: ProgressBar,
+    writerSemaphore: CandidateWriterSemaphore,
+  ) {
     super(progressBar, ReportGenerator.name);
     this.options = options;
+    this.writerSemaphore = writerSemaphore;
   }
 
   /**
@@ -35,22 +42,12 @@ export default class ReportGenerator extends Module {
     const hasAnyGamesFoundAtAll = datStatuses.some((datStatus) =>
       datStatus.anyGamesFound(this.options),
     );
-    const matchedFileCsvs = (
-      await Promise.all(
-        datStatuses
-          .filter((datStatus) => datStatus.anyGamesFound(this.options) || !hasAnyGamesFoundAtAll)
-          .toSorted((a, b) => a.getDATName().localeCompare(b.getDATName()))
-          .map(async (datsStatus) => await datsStatus.toCsv(this.options)),
-      )
-    )
-      .filter((csv) => csv.length > 0)
-      .map((csv, idx) => {
-        // Strip the CSV header from everything except the first file
-        if (idx === 0) {
-          return csv;
-        }
-        return csv.split('\n').slice(1).join('\n');
-      });
+    const matchedFileCsvs = await Promise.all(
+      datStatuses
+        .filter((datStatus) => datStatus.anyGamesFound(this.options) || !hasAnyGamesFoundAtAll)
+        .toSorted((a, b) => a.getDATName().localeCompare(b.getDATName()))
+        .map(async (datsStatus) => await datsStatus.toCsv(this.options)),
+    );
 
     const usedFilePaths = new Set(
       datStatuses
@@ -83,15 +80,18 @@ export default class ReportGenerator extends Module {
 
     const cleanedCsv = await DATStatus.filesToCsv(cleanedOutputFiles, GameStatus.DELETED);
 
-    this.prefixedLogger.info(`writing report '${reportPath}'`);
-    const reportPathDir = path.dirname(reportPath);
-    if (!(await FsUtil.exists(reportPathDir))) {
-      await FsUtil.mkdir(reportPathDir, { recursive: true });
-    }
     const rows = [...matchedFileCsvs, duplicateCsv, unusedCsv, cleanedCsv].filter(
       (csv) => csv.length > 0,
     );
-    await FsUtil.writeFile(reportPath, rows.join('\n'));
+    const contents = rows.length > 0 ? [await DATStatus.getCsvHeader(), ...rows].join('\n') : '';
+    await this.writerSemaphore.runExclusive(async () => {
+      this.prefixedLogger.info(`writing report '${reportPath}'`);
+      const reportPathDir = path.dirname(reportPath);
+      if (!(await FsUtil.exists(reportPathDir))) {
+        await FsUtil.mkdir(reportPathDir, { recursive: true });
+      }
+      await FsUtil.writeFile(reportPath, contents);
+    });
     this.prefixedLogger.trace(
       `wrote ${IntlUtil.toLocaleString(datStatuses.length)} CSV row${datStatuses.length === 1 ? '' : 's'}: ${reportPath}`,
     );

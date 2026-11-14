@@ -1,12 +1,12 @@
-import type { Readable } from 'node:stream';
-
 import type File from '../models/files/file.js';
 import APSPatch from '../models/patches/apsPatch.js';
 import BPSPatch from '../models/patches/bpsPatch.js';
+import BSDiffPatch from '../models/patches/bsdiffPatch.js';
 import DPSPatch from '../models/patches/dpsPatch.js';
 import IPSPatch from '../models/patches/ipsPatch.js';
 import NinjaPatch from '../models/patches/ninjaPatch.js';
 import type Patch from '../models/patches/patch.js';
+import PMSRPatch from '../models/patches/pmsrPatch.js';
 import PPFPatch from '../models/patches/ppfPatch.js';
 import UPSPatch from '../models/patches/upsPatch.js';
 import VcdiffPatch from '../models/patches/vcdiffPatch.js';
@@ -34,6 +34,11 @@ export default class PatchFactory {
       factory: BPSPatch.patchFrom.bind(BPSPatch),
     },
     {
+      extensions: BSDiffPatch.SUPPORTED_EXTENSIONS,
+      fileSignatures: [BSDiffPatch.FILE_SIGNATURE],
+      factory: BSDiffPatch.patchFrom.bind(BSDiffPatch),
+    },
+    {
       extensions: DPSPatch.SUPPORTED_EXTENSIONS,
       fileSignatures: [],
       factory: DPSPatch.patchFrom.bind(DPSPatch),
@@ -47,6 +52,11 @@ export default class PatchFactory {
       extensions: NinjaPatch.SUPPORTED_EXTENSIONS,
       fileSignatures: [NinjaPatch.FILE_SIGNATURE],
       factory: NinjaPatch.patchFrom.bind(NinjaPatch),
+    },
+    {
+      extensions: PMSRPatch.SUPPORTED_EXTENSIONS,
+      fileSignatures: [PMSRPatch.FILE_SIGNATURE],
+      factory: PMSRPatch.patchFrom.bind(PMSRPatch),
     },
     {
       extensions: PPFPatch.SUPPORTED_EXTENSIONS,
@@ -92,33 +102,14 @@ export default class PatchFactory {
     return undefined;
   }
 
-  private static async readHeaderHex(readable: Readable, length: number): Promise<string> {
-    const chunks: Buffer[] = [];
-    let readBytes = 0;
-
-    for await (const chunk of readable as AsyncIterable<Buffer>) {
-      if (chunk.length > 0) {
-        chunks.push(chunk);
-        readBytes += chunk.length;
-      }
-
-      // Stop reading when we get enough data, trigger a 'close' event
-      if (readBytes >= length) {
-        break;
-      }
-    }
-
-    return Buffer.concat(chunks).subarray(0, length).toString('hex').toLowerCase();
-  }
-
   /**
    * Return a {@link Patch} for a file by reading its leading bytes and matching them against
    * the known patch-format file signatures, or undefined if no signature matches.
    */
   static async patchFromFileContents(file: File): Promise<Patch | undefined> {
-    const fileHeader = await file.createReadStream(
-      async (readable) => await this.readHeaderHex(readable, this.MAX_HEADER_LENGTH_BYTES),
-    );
+    const fileHeader = (await file.readFirstBytes(this.MAX_HEADER_LENGTH_BYTES))
+      .toString('hex')
+      .toLowerCase();
 
     const parsers = Object.values(this.PATCH_PARSERS);
     for (const parser of parsers) {

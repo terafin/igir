@@ -1,5 +1,3 @@
-import path from 'node:path';
-
 import stripAnsi from 'strip-ansi';
 
 import MappableSemaphore from '../../src/async/mappableSemaphore.js';
@@ -24,6 +22,7 @@ import CandidateGenerator from '../../src/modules/candidates/candidateGenerator.
 import DATPreferer from '../../src/modules/dats/datPreferer.js';
 import ROMIndexer from '../../src/modules/roms/romIndexer.js';
 import StatusGenerator from '../../src/modules/statusGenerator.js';
+import PathUtil from '../../src/utils/pathUtil.js';
 import ProgressBarFake from '../console/progressBarFake.js';
 
 const gameNameNoRoms = 'no roms';
@@ -323,8 +322,7 @@ describe('toCSV', () => {
         candidates,
       );
       await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
+        .toEqual(`dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game with multiple roms,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game with single rom,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
@@ -345,8 +343,7 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
         candidates,
       );
       await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
+        .toEqual(`dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game prototype (proto),MISSING,,false,false,false,false,false,false,false,false,true,false,false,false,false
 dat,game with multiple roms,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
@@ -373,8 +370,7 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
 
       const datStatus = new StatusGenerator(options, new ProgressBarFake()).generate(dummyDat, []);
       await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
+        .toEqual(`dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game prototype (proto),MISSING,,false,false,false,false,false,false,false,false,true,false,false,false,false
 dat,game with multiple roms,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
@@ -388,8 +384,7 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
 
       const datStatus = new StatusGenerator(options, new ProgressBarFake()).generate(dummyDat, []);
       await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
+        .toEqual(`dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game prototype (proto),MISSING,,false,false,false,false,false,false,false,false,true,false,false,false,false
 dat,game with multiple roms,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
@@ -401,9 +396,9 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
       const options = new Options({ ...defaultOptions, onlyBios: true });
 
       const datStatus = new StatusGenerator(options, new ProgressBarFake()).generate(dummyDat, []);
-      await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false`);
+      await expect(datStatus.toCsv(options)).resolves.toEqual(
+        `dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false`,
+      );
     });
 
     // NOTE(cemmer): the device game shows here because DATFilter is never run, and this is fine
@@ -412,8 +407,7 @@ dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,fals
 
       const datStatus = new StatusGenerator(options, new ProgressBarFake()).generate(dummyDat, []);
       await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
+        .toEqual(`dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game prototype (proto),MISSING,,false,false,false,false,false,false,false,false,true,false,false,false,false
 dat,game with multiple roms,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
@@ -425,9 +419,9 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
       const options = new Options({ ...defaultOptions, onlyDevice: true });
 
       const datStatus = new StatusGenerator(options, new ProgressBarFake()).generate(dummyDat, []);
-      await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false`);
+      await expect(datStatus.toCsv(options)).resolves.toEqual(
+        `dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false`,
+      );
     });
   });
 
@@ -442,8 +436,7 @@ dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,fal
         candidates,
       );
       await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,FOUND,${path.resolve('bios.rom')},false,true,true,false,false,false,false,false,false,false,false,false,false
+        .toEqual(`dat,bios,FOUND,${PathUtil.resolve('bios.rom')},false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game prototype (proto),MISSING,,false,false,false,false,false,false,false,false,true,false,false,false,false
 dat,game with multiple roms,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
@@ -475,11 +468,10 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
         candidates,
       );
       await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
+        .toEqual(`dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game prototype (proto),MISSING,,false,false,false,false,false,false,false,false,true,false,false,false,false
-dat,game with multiple roms,INCOMPLETE,${path.resolve('one.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+dat,game with multiple roms,INCOMPLETE,${PathUtil.resolve('one.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game with single rom,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false`);
     });
@@ -494,10 +486,9 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
         candidates,
       );
       await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
+        .toEqual(`dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
-dat,game prototype (proto),FOUND,${path.resolve('game prototype (proto).rom')},false,false,false,false,false,false,false,false,true,false,false,false,false
+dat,game prototype (proto),FOUND,${PathUtil.resolve('game prototype (proto).rom')},false,false,false,false,false,false,false,false,true,false,false,false,false
 dat,game with multiple roms,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game with single rom,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false`);
@@ -513,12 +504,11 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
         candidates,
       );
       await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
+        .toEqual(`dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game prototype (proto),MISSING,,false,false,false,false,false,false,false,false,true,false,false,false,false
 dat,game with multiple roms,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
-dat,game with single rom,FOUND,${path.resolve('game.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+dat,game with single rom,FOUND,${PathUtil.resolve('game.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false`);
     });
   });
@@ -544,14 +534,13 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
       candidates,
     );
     await expect(datStatus.toCsv(options)).resolves
-      .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
+      .toEqual(`dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game prototype (proto),MISSING,,false,false,false,false,false,false,false,false,true,false,false,false,false
 dat,game with multiple roms,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game with single rom,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
-dat,patched game,FOUND,${path.resolve('patched.rom')},true,false,true,false,false,false,false,false,false,false,false,false,false`);
+dat,patched game,FOUND,${PathUtil.resolve('patched.rom')},true,false,true,false,false,false,false,false,false,false,false,false,false`);
   });
 
   it('should report every game as found when all are present', async () => {
@@ -569,12 +558,11 @@ dat,patched game,FOUND,${path.resolve('patched.rom')},true,false,true,false,fals
       candidates,
     );
     await expect(datStatus.toCsv(options)).resolves
-      .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,FOUND,${path.resolve('bios.rom')},false,true,true,false,false,false,false,false,false,false,false,false,false
+      .toEqual(`dat,bios,FOUND,${PathUtil.resolve('bios.rom')},false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
-dat,game prototype (proto),FOUND,${path.resolve('game prototype (proto).rom')},false,false,false,false,false,false,false,false,true,false,false,false,false
-dat,game with multiple roms,FOUND,"${path.resolve('one.rom')}|${path.resolve('two.rom')}",false,false,true,false,false,false,false,false,false,false,false,false,false
-dat,game with single rom,FOUND,${path.resolve('game.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+dat,game prototype (proto),FOUND,${PathUtil.resolve('game prototype (proto).rom')},false,false,false,false,false,false,false,false,true,false,false,false,false
+dat,game with multiple roms,FOUND,"${PathUtil.resolve('one.rom')}|${PathUtil.resolve('two.rom')}",false,false,true,false,false,false,false,false,false,false,false,false,false
+dat,game with single rom,FOUND,${PathUtil.resolve('game.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false`);
   });
 
@@ -592,8 +580,7 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
       candidates,
     );
     await expect(datStatus.toCsv(options)).resolves
-      .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
+      .toEqual(`dat,bios,MISSING,,false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game with multiple roms,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,game with single rom,MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false
@@ -619,11 +606,10 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
       candidates,
     );
     await expect(datStatus.toCsv(options)).resolves
-      .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,bios,FOUND,${path.resolve('bios.rom')},false,true,true,false,false,false,false,false,false,false,false,false,false
+      .toEqual(`dat,bios,FOUND,${PathUtil.resolve('bios.rom')},false,true,true,false,false,false,false,false,false,false,false,false,false
 dat,device,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false
-dat,game with multiple roms,FOUND,"${path.resolve('one.rom')}|${path.resolve('two.rom')}",false,false,true,false,false,false,false,false,false,false,false,false,false
-dat,game with single rom,FOUND,${path.resolve('game.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
+dat,game with multiple roms,FOUND,"${PathUtil.resolve('one.rom')}|${PathUtil.resolve('two.rom')}",false,false,true,false,false,false,false,false,false,false,false,false,false
+dat,game with single rom,FOUND,${PathUtil.resolve('game.rom')},false,false,true,false,false,false,false,false,false,false,false,false,false
 dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false`);
   });
 
@@ -647,9 +633,9 @@ dat,no roms,FOUND,,false,false,true,false,false,false,false,false,false,false,fa
         diskOnlyDat,
         candidates,
       );
-      await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,${gameNameDiskOnly},MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false`);
+      await expect(datStatus.toCsv(options)).resolves.toEqual(
+        `dat,${gameNameDiskOnly},MISSING,,false,false,true,false,false,false,false,false,false,false,false,false,false`,
+      );
     });
 
     it('should report a game with only a missing disk as found when excludeDisks:true', async () => {
@@ -660,9 +646,9 @@ dat,${gameNameDiskOnly},MISSING,,false,false,true,false,false,false,false,false,
         diskOnlyDat,
         candidates,
       );
-      await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,${gameNameDiskOnly},FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false`);
+      await expect(datStatus.toCsv(options)).resolves.toEqual(
+        `dat,${gameNameDiskOnly},FOUND,,false,false,true,false,false,false,false,false,false,false,false,false,false`,
+      );
     });
 
     it('should report a game with one found disk as found', async () => {
@@ -673,9 +659,9 @@ dat,${gameNameDiskOnly},FOUND,,false,false,true,false,false,false,false,false,fa
         diskOnlyDat,
         candidates,
       );
-      await expect(datStatus.toCsv(options)).resolves
-        .toEqual(`DAT Name,Game Name,Status,ROM Files,Patched,BIOS,Retail Release,Unlicensed,Debug,Demo,Beta,Sample,Prototype,Program,Aftermarket,Homebrew,Bad
-dat,${gameNameDiskOnly},FOUND,${path.resolve('one.chd')},false,false,true,false,false,false,false,false,false,false,false,false,false`);
+      await expect(datStatus.toCsv(options)).resolves.toEqual(
+        `dat,${gameNameDiskOnly},FOUND,${PathUtil.resolve('one.chd')},false,false,true,false,false,false,false,false,false,false,false,false,false`,
+      );
     });
   });
 });

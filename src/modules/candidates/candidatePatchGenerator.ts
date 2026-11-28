@@ -61,15 +61,7 @@ export default class CandidatePatchGenerator extends Module {
   }
 
   private static indexPatchesByCrcBefore(patches: Patch[]): Map<string, Patch[]> {
-    return patches.reduce((map, patch) => {
-      const key = patch.getCrcBefore().toLowerCase();
-      if (map.has(key)) {
-        map.get(key)?.push(patch);
-      } else {
-        map.set(key, [patch]);
-      }
-      return map;
-    }, new Map<string, Patch[]>());
+    return Map.groupBy(patches, (patch) => patch.getCrcBefore());
   }
 
   private build(
@@ -163,8 +155,9 @@ export default class CandidatePatchGenerator extends Module {
           inputFile = inputFile.withPatch(patch);
 
           // Build a new output file
-          const extMatch = /[^.]+((\.[a-zA-Z0-9]+)+)$/.exec(romWithFiles.getRom().getName());
-          const extractedFileName = patchedRomName + (extMatch === null ? '' : extMatch[1]);
+          const extension =
+            /[^.]+((\.[a-zA-Z0-9]+)+)$/.exec(romWithFiles.getRom().getName())?.at(1) ?? '';
+          const extractedFileName = patchedRomName + extension;
           if (outputFile instanceof ArchiveEntry) {
             outputFile = outputFile.withProps({
               archive: outputFile

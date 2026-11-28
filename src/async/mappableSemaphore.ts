@@ -28,32 +28,40 @@ export default class MappableSemaphore extends Semaphore {
     }
 
     let firstError: Error | undefined;
+    const results: Awaited<OUT>[] = [];
 
-    const results = await Promise.allSettled(
-      values.map(
-        async (value) =>
-          await this.runExclusive(async () => {
-            // Skip work if a prior callback already failed
-            if (firstError !== undefined) {
-              throw firstError;
-            }
-            try {
-              return await callback(value);
-            } catch (error) {
-              const wrappedError = error instanceof Error ? error : new Error(String(error));
-              firstError ??= wrappedError;
-              this.cancel();
-              throw wrappedError;
-            }
-          }),
-      ),
+    // Use a fixed pool of workers that each take the next value, rather than creating one promise
+    // per value, so that at most `threads` waiters are ever queued on the semaphore per call
+    const valueEntries = values.entries();
+    const worker = async (): Promise<void> => {
+      for (const [idx, value] of valueEntries) {
+        if (firstError !== undefined) {
+          return;
+        }
+        await this.runExclusive(async () => {
+          // Skip work if a prior callback already failed
+          if (firstError !== undefined) {
+            return;
+          }
+          try {
+            results[idx] = await callback(value);
+          } catch (error) {
+            firstError ??= error instanceof Error ? error : new Error(String(error));
+          }
+        });
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(this.threads, values.length) }, async () => {
+        await worker();
+      }),
     );
 
-    // Re-throw the first real error after all promises have settled
+    // Re-throw the first real error after all in-flight callbacks have finished
     if (firstError !== undefined) {
       throw firstError;
     }
 
-    return results.filter((result) => result.status === 'fulfilled').map((result) => result.value);
+    return results;
   }
 }

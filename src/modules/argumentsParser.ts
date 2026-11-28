@@ -10,7 +10,7 @@ import Defaults from '../globals/defaults.js';
 import Package from '../globals/package.js';
 import Internationalization from '../models/dats/internationalization.js';
 import { ChecksumBitmask, ChecksumBitmaskInverted } from '../models/files/fileChecksums.js';
-import ROMHeader from '../models/files/romHeader.js';
+import FileSignature from '../models/files/fileSignature.js';
 import Options, {
   FixExtension,
   FixExtensionInverted,
@@ -37,6 +37,7 @@ import Options, {
 import yargs from '../polyfill/yargsShim.js';
 import ArrayUtil from '../utils/arrayUtil.js';
 import ConsoleUtil from '../utils/consoleUtil.js';
+import PathUtil from '../utils/pathUtil.js';
 
 /**
  * Parse a {@link process.argv} (without its first two arguments, the Node.js executable and the
@@ -61,12 +62,12 @@ export default class ArgumentsParser {
 
   private static getHelpWidth(argv: string[]): number {
     // Look for --help/-h with a numerical value
-    for (let i = 0; i < argv.length; i += 1) {
-      if (!(argv[i].toLowerCase() === '--help' || argv[i].toLowerCase() === '-h')) {
+    for (const [i, arg] of argv.entries()) {
+      if (!(arg.toLowerCase() === '--help' || arg.toLowerCase() === '-h')) {
         continue;
       }
 
-      const helpFlagVal = Math.trunc(Number(argv[i + 1]));
+      const helpFlagVal = Math.trunc(Number(argv.at(i + 1)));
       if (!Number.isNaN(helpFlagVal)) {
         return helpFlagVal;
       }
@@ -109,14 +110,17 @@ export default class ArgumentsParser {
 
     // Add every command to a yargs object, recursively, resulting in the ability to specify
     // multiple commands
-    const commands = [
+    const commands: [string, string][] = [
       ['copy', 'Copy ROM files from the input to output directory'],
       ['move', 'Move ROM files from the input to output directory'],
       ['link', 'Create links in the output directory to ROM files in the input directory'],
       ['extract', 'Extract ROM files in archives when copying or moving'],
       ['zip', 'Create zip archives of ROMs when copying or moving'],
       ['playlist', 'Create playlist files for multi-disc games'],
-      ['test', 'Test ROMs for accuracy after writing them to the output directory'],
+      [
+        'test',
+        'Test ROMs for accuracy after writing them, or test input files if no write command is given',
+      ],
       ['dir2dat', 'Generate a DAT from all input files'],
       ['fixdat', 'Generate a fixdat of any missing games for every DAT processed (requires --dat)'],
       ['clean', 'Recycle unknown files in the output directory'],
@@ -418,6 +422,10 @@ export default class ArgumentsParser {
           logger.warn(
             "archived files can't be patched unless the 'extract' or 'zip' command is used",
           );
+        } else if (checkArgv.patch && checkArgv['zip-exclude'] !== undefined) {
+          logger.warn(
+            "archived files excluded from zipping by '--zip-exclude <glob>' won't be patched unless the 'extract' command is used instead of 'zip'",
+          );
         }
         return true;
       })
@@ -431,19 +439,21 @@ export default class ArgumentsParser {
         requiresArg: true,
       })
       .middleware((middlewareArgv) => {
-        if (
-          !(middlewareArgv.output && middlewareArgv._.includes('clean') && middlewareArgv.input)
-        ) {
+        if (!(
+          middlewareArgv.output &&
+          middlewareArgv._.includes('clean') &&
+          middlewareArgv.input
+        )) {
           return;
         }
-        const outputResolved = path.resolve(middlewareArgv.output as string);
+        const outputResolved = PathUtil.resolve(middlewareArgv.output as string);
         if (
           middlewareArgv.input.every(
-            (inputPath) => !outputResolved.startsWith(path.resolve(inputPath as string)),
+            (inputPath) => !outputResolved.startsWith(PathUtil.resolve(inputPath as string)),
           )
         ) {
           logger.warn(
-            `'${middlewareArgv.output as string}' was provided as the output path but not as an input path, the 'clean' command may delete more files than you intended!`,
+            `'${middlewareArgv.output as string}' was provided as the output path but not as an input path, the 'clean' command may delete more files than you intended`,
           );
         }
       }, false)
@@ -688,7 +698,7 @@ export default class ArgumentsParser {
       .option('remove-headers', {
         group: groupRomHeader,
         alias: 'H',
-        description: `Remove known headers from ROMs, optionally limited to a list of comma-separated file extensions (supported: ${ROMHeader.getSupportedExtensions().join(', ')})`,
+        description: `Remove known headers from ROMs, optionally limited to a list of comma-separated file extensions (supported: ${FileSignature.getROMHeaderExtensions().join(', ')})`,
         type: 'string',
         coerce: (vals: string | string[]) =>
           (Array.isArray(vals) ? vals : [vals]).flatMap((val) => {
@@ -916,6 +926,11 @@ export default class ArgumentsParser {
         description:
           'Output only a single game per parent (1G1R) (required for all options below, requires DATs with parent/clone information)',
         type: 'boolean',
+      })
+      .middleware((middlewareArgv) => {
+        if (middlewareArgv.single && middlewareArgv.patch) {
+          logger.warn('--single might filter out files that you intended to patch');
+        }
       })
       .option('prefer-game-regex', {
         group: groupRomPriority,
@@ -1234,8 +1249,11 @@ export default class ArgumentsParser {
 Advanced usage:
 
   Tokens that are replaced when generating the output (--output) path of a ROM:
+    {datFileName}     The filename of the DAT that contains the ROM, without extension
     {datName}         The name of the DAT that contains the ROM (e.g. "Nintendo - Game Boy")
     {datDescription}  The description of the DAT that contains the ROM
+    {datVersion}      The version of the DAT that contains the ROM
+    {datDate}         The date of the DAT that contains the ROM
     {region}          The region of the ROM release (e.g. "USA"), each ROM can have multiple
     {language}        The language of the ROM release (e.g. "En"), each ROM can have multiple
     {type}            The type of the game (e.g. "Retail", "Demo", "Prototype")
@@ -1258,6 +1276,7 @@ Advanced usage:
     {onion}     The ROM's emulator-specific /Roms/* directory for OnionOS/GarlicOS (e.g. "GB")
     {pocket}    The ROM's core-specific /Assets/* directory for the Analogue Pocket (e.g. "gb")
     {retrodeck} The ROM's emulator-specific /roms/* directory for the 'RetroDECK' image (e.g. "gb")
+    {retronas}  The ROM's system-specific /roms/* directory for RetroNAS (e.g. "nintendo/gameboy")
     {rocknix}   The ROM's emulator-specific /roms/* directory for ROCKNIX (e.g. "gb")
     {romm}      The ROM's manager-specific /roms/* directory for 'RomM' (e.g. "gb")
     {spruce}    The ROM's emulator-specific /Roms/* directory for SpruceOS (e.g. "GB")

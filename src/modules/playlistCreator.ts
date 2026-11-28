@@ -1,7 +1,6 @@
 import path from 'node:path';
 
-import async from 'async';
-
+import type CandidateWriterSemaphore from '../async/candidateWriterSemaphore.js';
 import type ProgressBar from '../console/progressBar.js';
 import { ProgressBarSymbol } from '../console/progressBar.js';
 import type DAT from '../models/dats/dat.js';
@@ -19,10 +18,16 @@ import Module from './module.js';
  */
 export default class PlaylistCreator extends Module {
   private readonly options: Options;
+  private readonly writerSemaphore: CandidateWriterSemaphore;
 
-  constructor(options: Options, progressBar: ProgressBar) {
+  constructor(
+    options: Options,
+    progressBar: ProgressBar,
+    writerSemaphore: CandidateWriterSemaphore,
+  ) {
     super(progressBar, PlaylistCreator.name);
     this.options = options;
+    this.writerSemaphore = writerSemaphore;
   }
 
   /**
@@ -48,22 +53,18 @@ export default class PlaylistCreator extends Module {
 
     // Write playlists for games that have playlist-able files, i.e. from disc merging
     remainingCandidates = (
-      await async.mapLimit(
-        remainingCandidates,
-        this.options.getWriterThreads(),
-        async (candidate: WriteCandidate) => {
-          const writtenFile = await this.maybeWritePlaylist(
-            dat,
-            candidate,
-            candidate.getGame().getName(),
-          );
-          if (writtenFile === undefined) {
-            // We didn't write a playlist file, keep this candidate for more processing
-            return candidate;
-          }
-          writtenPlaylistPaths.push(writtenFile);
-        },
-      )
+      await this.writerSemaphore.map(remainingCandidates, async (candidate: WriteCandidate) => {
+        const writtenFile = await this.maybeWritePlaylist(
+          dat,
+          candidate,
+          candidate.getGame().getName(),
+        );
+        if (writtenFile === undefined) {
+          // We didn't write a playlist file, keep this candidate for more processing
+          return candidate;
+        }
+        writtenPlaylistPaths.push(writtenFile);
+      })
     ).filter((candidate) => candidate !== undefined);
 
     // Write playlists for games that could have been disc merged together but weren't
@@ -71,9 +72,8 @@ export default class PlaylistCreator extends Module {
       remainingCandidates,
       (candidate) => candidate.getGame().getName(),
     );
-    await async.mapLimit(
+    await this.writerSemaphore.map(
       [...gameNamesToCandidates],
-      this.options.getWriterThreads(),
       async ([gameName, candidates]: [string, WriteCandidate[]]) => {
         const writtenFile = await this.maybeWritePlaylist(dat, candidates, gameName);
         if (writtenFile === undefined) {
@@ -137,8 +137,9 @@ export default class PlaylistCreator extends Module {
   }
 
   private static getCommonDirectory(files: File[]): string {
-    if (files.length === 1) {
-      return path.dirname(files[0].getFilePath());
+    const [firstFile] = files;
+    if (files.length === 1 && firstFile !== undefined) {
+      return path.dirname(firstFile.getFilePath());
     }
 
     const fileDirsSplit = files.map((file) => path.dirname(file.getFilePath()).split(path.sep));
@@ -148,10 +149,14 @@ export default class PlaylistCreator extends Module {
     let depth = 0;
     while (depth <= maxDepth) {
       const fileSubPaths = fileDirsSplit.map((split) => split.slice(0, depth).join(path.sep));
-      if (fileSubPaths.some((p) => p !== fileSubPaths[0])) {
+      const [firstFileSubPath] = fileSubPaths;
+      if (
+        firstFileSubPath === undefined ||
+        fileSubPaths.some((fileSubPath) => fileSubPath !== firstFileSubPath)
+      ) {
         break;
       }
-      lastCommonDir = fileSubPaths[0];
+      lastCommonDir = firstFileSubPath;
       depth += 1;
     }
     return lastCommonDir;

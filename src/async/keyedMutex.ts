@@ -92,16 +92,18 @@ export default class KeyedMutex {
             }
             const lruEntry = this.keyMutexes.get(lruKey);
             if (
-              !uniqueKeySet.has(lruKey) &&
-              lruEntry !== undefined &&
-              !lruEntry.mutex.isLocked() &&
-              lruEntry.pendingLocks === 0
+              uniqueKeySet.has(lruKey) ||
+              lruEntry === undefined ||
+              lruEntry.mutex.isLocked() ||
+              lruEntry.pendingLocks !== 0
             ) {
-              lruEntry.mutex.release();
-              this.keyMutexes.delete(lruKey);
-              this.keyMutexesLru.delete(lruKey);
-              keysToEvict--;
+              continue;
             }
+
+            lruEntry.mutex.release();
+            this.keyMutexes.delete(lruKey);
+            this.keyMutexesLru.delete(lruKey);
+            keysToEvict--;
           }
         }
 
@@ -121,15 +123,16 @@ export default class KeyedMutex {
 
     let nextToAcquire = 0;
     try {
-      for (; nextToAcquire < entries.length; nextToAcquire += 1) {
-        await entries[nextToAcquire].mutex.acquire();
+      for (const entry of entries) {
+        await entry.mutex.acquire();
         // Once acquired, isLocked() protects this entry from eviction; decrement the pending count
-        entries[nextToAcquire].pendingLocks -= 1;
+        entry.pendingLocks -= 1;
+        nextToAcquire += 1;
       }
     } catch (error) {
       // Decrement pending counts we still owe for entries past the failure point.
-      for (let i = nextToAcquire; i < entries.length; i += 1) {
-        entries[i].pendingLocks -= 1;
+      for (const entry of entries.slice(nextToAcquire)) {
+        entry.pendingLocks -= 1;
       }
       throw error;
     }

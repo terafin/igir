@@ -80,15 +80,17 @@ export default class Logger {
       return false;
     }
 
-    let messageString = String(message);
+    const messageString = String(message);
 
     // Keep consecutive frozen progress-bar snapshots visually adjacent, and separate a frozen
-    // snapshot from a following non-frozen log line with a blank line
+    // snapshot from a following non-frozen log line with a blank line. This spacing is purely
+    // visual, so it is only applied to the terminal and never to the log file.
+    let terminalMessageString = messageString;
     if (this.lastPrintedFrozen) {
       if (isFrozen) {
-        messageString = messageString.replace(/^\n+/, '');
+        terminalMessageString = terminalMessageString.replace(/^\n+/, '');
       } else {
-        messageString = `\n${messageString}`;
+        terminalMessageString = `\n${terminalMessageString}`;
       }
     }
 
@@ -97,10 +99,14 @@ export default class Logger {
     }
 
     if (this.logFileHandle !== undefined) {
+      // Log files are meant to be read as a sequence of messages, so blank lines are omitted
       const formattedMessage = stripAnsi(
         Logger.formatMessage(LogLevel.TRACE, logLevel, messageString, prefix),
-      );
-      if (formattedMessage.trim()) {
+      )
+        .split('\n')
+        .filter((line) => line.trim())
+        .join('\n');
+      if (formattedMessage) {
         fs.writeSync(this.logFileHandle, `${formattedMessage}\n`);
       }
     }
@@ -109,7 +115,9 @@ export default class Logger {
       return false;
     }
 
-    this.terminal.writeLine(Logger.formatMessage(this.logLevel, logLevel, messageString, prefix));
+    this.terminal.writeLine(
+      Logger.formatMessage(this.logLevel, logLevel, terminalMessageString, prefix),
+    );
     return true;
   }
 
@@ -199,16 +207,16 @@ export default class Logger {
     const midLine = Math.min(Math.ceil(logoSplit.length / 2), logoSplit.length - 1);
     const maxLineLen = logoSplit.reduce((max, line) => Math.max(max, line.length), 0);
     logoSplit[midLine - 2] =
-      `${logoSplit[midLine - 2].padEnd(maxLineLen, ' ')}   ROM collection manager`;
+      `${(logoSplit.at(midLine - 2) ?? '').padEnd(maxLineLen, ' ')}   ROM collection manager`;
     logoSplit[midLine - 1] =
-      `${logoSplit[midLine - 1].padEnd(maxLineLen, ' ')}   ${terminalLink(Package.HOMEPAGE, Package.HOMEPAGE, { fallback: false })}`;
+      `${(logoSplit.at(midLine - 1) ?? '').padEnd(maxLineLen, ' ')}   ${terminalLink(Package.HOMEPAGE, Package.HOMEPAGE, { fallback: false })}`;
 
     let runtime = `Node.js v${process.versions.node}`;
     if (process.versions.bun) {
       runtime = `Bun v${process.versions.bun}`;
     }
     logoSplit[midLine + 1] =
-      `${logoSplit[midLine + 1].padEnd(maxLineLen, ' ')}   v${Package.VERSION} ${chalk.dim(`(${runtime})`)}`;
+      `${(logoSplit.at(midLine + 1) ?? '').padEnd(maxLineLen, ' ')}   v${Package.VERSION} ${chalk.dim(`(${runtime})`)}`;
 
     this.write(LogLevel.ALWAYS, `${logoSplit.join('\n')}\n`);
   }

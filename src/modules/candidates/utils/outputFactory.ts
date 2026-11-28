@@ -19,6 +19,7 @@ import ZeroSizeFile from '../../../models/files/zeroSizeFile.js';
 import type Options from '../../../models/options.js';
 import { FixExtension, GameSubdirMode } from '../../../models/options.js';
 import FsUtil from '../../../utils/fsUtil.js';
+import PathUtil from '../../../utils/pathUtil.js';
 import outputTokensData from './consoleTokens.json' with { type: 'json' };
 
 interface ConsoleTokensJson {
@@ -122,7 +123,7 @@ export default class OutputFactory {
 
     return new OutputPath({
       root: '',
-      dir: path.resolve(this.getDir(options, dat, game, inputFile, basename, romBasenames)),
+      dir: PathUtil.resolve(this.getDir(options, dat, game, inputFile, basename, romBasenames)),
       base: '',
       name,
       ext,
@@ -168,7 +169,7 @@ export default class OutputFactory {
     ) {
       const mirroredFilePath = options
         .getInputPaths()
-        .map((inputPath) => path.resolve(inputPath))
+        .map((inputPath) => PathUtil.resolve(inputPath))
         .reduce((inputFilePath, inputPath) => {
           const inputPathRegex = new RegExp(
             `^${inputPath.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\/]?`,
@@ -179,7 +180,7 @@ export default class OutputFactory {
       output = path.join(output, mirroredDirPath);
     }
 
-    const datFilePath = dat.getFilePath();
+    const datFilePath = dat.getFile()?.getFilePath();
     if (
       options.getDirDatMirror() &&
       options.getDatPaths().length > 0 &&
@@ -187,23 +188,25 @@ export default class OutputFactory {
     ) {
       const mirroredFilePath = options
         .getDatPaths()
-        .map((datPath) => path.resolve(datPath))
+        .map((datPath) => PathUtil.resolve(datPath))
         .reduce((datFilePath, datPath) => {
           const datPathRegex = new RegExp(
             `^${datPath.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\/]?`,
           );
           return datFilePath.replace(datPathRegex, '');
-        }, path.resolve(datFilePath));
+        }, PathUtil.resolve(datFilePath));
       const mirroredDirPath = path.dirname(mirroredFilePath);
       output = path.join(output, mirroredDirPath);
     }
 
     if (options.getDirDatName() && dat.getName()) {
-      output = path.join(output, dat.getName());
+      // Don't allow DAT names to perform directory traversal
+      output = path.join(output, dat.getName().replaceAll(/[\\/]/g, '_'));
     }
     const datDescription = dat.getDescription();
     if (options.getDirDatDescription() && datDescription) {
-      output = path.join(output, datDescription);
+      // Don't allow DAT descriptions to perform directory traversal
+      output = path.join(output, datDescription.replaceAll(/[\\/]/g, '_'));
     }
 
     const dirLetter = this.getDirLetterParsed(options, romBasename, romBasenames);
@@ -232,8 +235,12 @@ export default class OutputFactory {
 
     const leftoverTokens = result.match(this.LEFTOVER_TOKEN_REGEX);
     if (leftoverTokens !== null && leftoverTokens.length > 0) {
+      const consoleTokenNames = this.loadConsoleTokenNames(options.getOutputConsoleTokens());
+      const consoleHint = leftoverTokens.some((token) => consoleTokenNames.has(token.slice(1, -1)))
+        ? `, no console is known for the DAT "${dat.getName()}"`
+        : '';
       throw new TokenReplacementException(
-        `failed to replace output token${leftoverTokens.length === 1 ? '' : 's'}: ${leftoverTokens.join(', ')}`,
+        `failed to replace output token${leftoverTokens.length === 1 ? '' : 's'}: ${leftoverTokens.join(', ')}${consoleHint}`,
       );
     }
 
@@ -275,11 +282,29 @@ export default class OutputFactory {
 
   private static replaceDatTokens(input: string, dat: DAT): string {
     let output = input;
+    const datFile = dat.getFile();
+    if (datFile) {
+      output = output.replace(
+        '{datFileName}',
+        path.parse(datFile.getExtractedFilePath()).name.replaceAll(/[\\/]/g, '_'),
+      );
+    }
+
     output = output.replace('{datName}', dat.getName().replaceAll(/[\\/]/g, '_'));
 
     const description = dat.getDescription();
     if (description) {
       output = output.replace('{datDescription}', description.replaceAll(/[\\/]/g, '_'));
+    }
+
+    const version = dat.getVersion();
+    if (version) {
+      output = output.replace('{datVersion}', version.replaceAll(/[\\/]/g, '_'));
+    }
+
+    const date = dat.getDate();
+    if (date) {
+      output = output.replace('{datDate}', date.replaceAll(/[\\/]/g, '_'));
     }
 
     return output;
@@ -328,7 +353,9 @@ export default class OutputFactory {
       const pattern = datNameRegex.slice(1, lastSlash);
       const flags = datNameRegex.slice(lastSlash + 1);
       const tokensMap = new Map(
-        Object.entries(tokens).filter((entry): entry is [string, string] => entry[1] !== undefined),
+        Object.entries(tokens).filter(
+          (entry): entry is [string, string] => entry.at(1) !== undefined,
+        ),
       );
       for (const [primary, alias] of Object.entries(this.TOKEN_ALIASES)) {
         const primaryValue = tokensMap.get(primary);
@@ -338,6 +365,15 @@ export default class OutputFactory {
       }
       return new ConsoleTokens(new RegExp(pattern, flags || undefined), extensions, tokensMap);
     });
+  }
+
+  @Memoize()
+  private static loadConsoleTokenNames(filePath: string | undefined): Set<string> {
+    return new Set(
+      this.loadTokensFile(filePath).flatMap((consoleTokens) => [
+        ...consoleTokens.getTokens().keys(),
+      ]),
+    );
   }
 
   private static getConsoleTokensForFilename(
@@ -403,7 +439,9 @@ export default class OutputFactory {
     const letterRuns: [string, Set<string>][][] = [];
     for (const tuple of tuples) {
       const lastRun = letterRuns.at(-1);
-      if (lastRun?.[0][0] === tuple[0]) {
+      const [letter] = tuple;
+      const [lastRunLetter] = lastRun?.at(0) ?? [];
+      if (lastRun !== undefined && lastRunLetter === letter) {
         lastRun.push(tuple);
       } else {
         letterRuns.push([tuple]);
@@ -458,22 +496,16 @@ export default class OutputFactory {
     if (options.getDirLetterGroup()) {
       // Flatten into a sorted list of [letter, Set(filenames)] tuples, one per subpath
       const flatTuples = [...lettersToFilenames]
-        .toSorted((a, b) => a[0].localeCompare(b[0]))
+        .toSorted(([aLetter], [bLetter]) => aLetter.localeCompare(bLetter))
         // Generate a tuple of [letter, Set(filenames)] for every subpath
         .reduce<[string, Set<string>][]>((arr, [letter, filenames]) => {
           // ROMs may have been grouped together into a subdirectory. For example, when a game has
           // multiple ROMs, they get grouped by their game name. Therefore, we have to understand
           // what the "sub-path" should be within the letter directory: the dirname if the ROM has a
           // subdir, or just the ROM's basename otherwise.
-          const subPathsToFilenames = [...filenames].reduce((subPathMap, filename) => {
-            const subPath = filename.replace(/[\\/].+$/, '');
-            if (subPathMap.has(subPath)) {
-              subPathMap.get(subPath)?.push(filename);
-            } else {
-              subPathMap.set(subPath, [filename]);
-            }
-            return subPathMap;
-          }, new Map<string, string[]>());
+          const subPathsToFilenames = Map.groupBy(filenames, (filename) =>
+            filename.replace(/[\\/].+$/, ''),
+          );
           const tuples = [...subPathsToFilenames]
             .toSorted(([subPathOne], [subPathTwo]) => subPathOne.localeCompare(subPathTwo))
             .map(
@@ -497,8 +529,10 @@ export default class OutputFactory {
           }
           // A group that spans only a single letter is named for that letter alone (e.g. "A"),
           // not as a range (e.g. "A-A"); this also keeps numeric-suffix splits as "A1", not "A-A1".
+          const [firstLetter] = firstTuple;
+          const [lastLetter] = lastTuple;
           const letterRange =
-            firstTuple[0] === lastTuple[0] ? firstTuple[0] : `${firstTuple[0]}-${lastTuple[0]}`;
+            firstLetter === lastLetter ? firstLetter : `${firstLetter}-${lastLetter}`;
           const existingFilenames = map.get(letterRange) ?? new Set<string>();
           for (const [, filenames] of tuples) {
             for (const filename of filenames) {
@@ -519,15 +553,9 @@ export default class OutputFactory {
         // multiple ROMs, they get grouped by their game name. Therefore, we have to understand
         // what the "sub-path" should be within the letter directory: the dirname if the ROM has a
         // subdir, or just the ROM's basename otherwise.
-        const subPathsToFilenames = [...filenames].reduce((subPathMap, filename) => {
-          const subPath = filename.replace(/[\\/].+$/, '');
-          if (subPathMap.has(subPath)) {
-            subPathMap.get(subPath)?.push(filename);
-          } else {
-            subPathMap.set(subPath, [filename]);
-          }
-          return subPathMap;
-        }, new Map<string, string[]>());
+        const subPathsToFilenames = Map.groupBy(filenames, (filename) =>
+          filename.replace(/[\\/].+$/, ''),
+        );
 
         if (subPathsToFilenames.size <= options.getDirLetterLimit()) {
           lettersMap.set(letter, new Set(filenames));
@@ -549,8 +577,9 @@ export default class OutputFactory {
       }, new Map<string, Set<string>>());
     }
 
-    const foundEntry = [...lettersToFilenames].find(([, filenames]) => filenames.has(romBasename));
-    return foundEntry ? foundEntry[0] : undefined;
+    const [letter] =
+      [...lettersToFilenames].find(([, filenames]) => filenames.has(romBasename)) ?? [];
+    return letter;
   }
 
   /**
@@ -639,14 +668,20 @@ export default class OutputFactory {
 
     // Should leave archived (are raw-copying/moving)
 
+    const archive = inputFile.getArchive();
+    const hasValidExt = archive
+      .getExtensions()
+      .some((ext) => inputFile.getFilePath().toLowerCase().endsWith(ext.toLowerCase()));
+
     // The regex is to preserve filenames that use 2+ extensions, e.g. "rom.nes.zip"
-    const oldExtMatch = /[^.]+((\.[a-zA-Z0-9]+)+)$/.exec(inputFile.getFilePath());
+    const inputExt = /[^.]+((\.[a-zA-Z0-9]+)+)$/.exec(inputFile.getFilePath())?.at(1);
     const oldExt =
-      oldExtMatch === null
-        ? // The input file has no extension, get the canonical extension from the {@link Archive}
-          inputFile.getArchive().getExtension()
+      inputExt === undefined || (options.shouldFixExtension() && !hasValidExt)
+        ? // The input file has no extension, or it has an invalid one we should correct, get the
+          // canonical extension from the {@link Archive}
+          archive.getExtension()
         : // Respect the input file's extension
-          oldExtMatch[1];
+          inputExt;
 
     // Generate the archive name from the game name
     const gameName =
@@ -671,7 +706,12 @@ export default class OutputFactory {
     return gameName + oldExt;
   }
 
-  private static getEntryPath(options: Options, game: Game, rom: ROM, inputFile: File): string {
+  /**
+   * Get the archive entry path that a {@link ROM} should have according to its {@link DAT}.
+   * Unlike {@link getPath}, this doesn't return the input file's own entry path when not writing,
+   * so it can be used to validate input archive entries.
+   */
+  static getEntryPath(options: Options, game: Game, rom: ROM, inputFile: File): string {
     const romBasename = this.getRomBasename(rom, inputFile);
     if (!options.shouldZipRom(rom)) {
       return romBasename;

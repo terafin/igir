@@ -7,6 +7,7 @@ import { E_CANCELED, Mutex } from 'async-mutex';
 
 import KeyedMutex from '../async/keyedMutex.js';
 import Timer from '../async/timer.js';
+import Defaults from '../globals/defaults.js';
 import FsUtil from '../utils/fsUtil.js';
 
 export interface CacheProps {
@@ -89,6 +90,24 @@ export default class Cache<V> {
   }
 
   /**
+   * Get the values of all keys, or undefined if any key is missing a value.
+   */
+  private static getAllKeys<T>(
+    keys: string[],
+    getter: (key: string) => T | undefined,
+  ): Map<string, T> | undefined {
+    const values = new Map<string, T>();
+    for (const key of keys) {
+      const value = getter(key);
+      if (value === undefined) {
+        return undefined;
+      }
+      values.set(key, value);
+    }
+    return values;
+  }
+
+  /**
    * Get the value of a key in the cache if it exists, or compute a value and set it in the cache
    * otherwise.
    */
@@ -132,24 +151,18 @@ export default class Cache<V> {
     }
 
     // Fast path: check all keys without obtaining any locks
-    const values = keys.map((key) => this.getUnsafe(key));
-    if (values.every((value) => value !== undefined)) {
-      return keys.reduce((map, key, idx) => {
-        map.set(key, values[idx]);
-        return map;
-      }, new Map<string, V>());
+    const values = Cache.getAllKeys(keys, (key) => this.getUnsafe(key));
+    if (values !== undefined) {
+      return values;
     }
 
     // Slow path: acquire all key locks, double-check, then compute if still needed.
     await this.keyedMutex.acquireMultiple(keys);
     try {
       // Re-check under lock using direct map access (not get(), which would deadlock)
-      const values = keys.map((key) => this.keyValues.get(key));
-      if (values.every((value) => value !== undefined)) {
-        return keys.reduce((map, key, idx) => {
-          map.set(key, values[idx]);
-          return map;
-        }, new Map<string, V>());
+      const values = Cache.getAllKeys(keys, (key) => this.keyValues.get(key));
+      if (values !== undefined) {
+        return values;
       }
 
       // Compute and store all values
@@ -264,8 +277,8 @@ export default class Cache<V> {
     try {
       const chunks: Buffer[] = [];
       await stream.promises.pipeline(
-        fs.createReadStream(this.filePath),
-        zlib.createGunzip(),
+        fs.createReadStream(this.filePath, { highWaterMark: Defaults.FILE_READING_CHUNK_SIZE }),
+        zlib.createGunzip({ chunkSize: Defaults.FILE_READING_CHUNK_SIZE }),
         new stream.Writable({
           write(chunk: Buffer, _enc: BufferEncoding, cb: () => void): void {
             chunks.push(chunk);
@@ -283,7 +296,7 @@ export default class Cache<V> {
       const keyValuesEntries = Object.entries(keyValuesObject);
       this.keyValues = new Map(keyValuesEntries);
     } catch {
-      /* ignored */
+      // ignored
     }
 
     return this;
@@ -344,14 +357,17 @@ export default class Cache<V> {
             fs.createWriteStream(tempFile),
           );
 
-          // Validate the file was written correctly
-          const tempFileCache = await new Cache({ filePath: tempFile }).load();
-          if (tempFileCache.size() !== Object.keys(keyValuesObject).length) {
-            // The written file is bad, don't use it
-            await FsUtil.rm(tempFile, { force: true });
-            this.hasChanged = true;
-            return;
-          }
+          // Validate the file was written correctly; gunzip will throw if the archive is missing
+          // its trailer (file is truncated) or if the CRC32 doesn't match (which shouldn't happen)
+          await stream.promises.pipeline(
+            fs.createReadStream(tempFile, { highWaterMark: Defaults.FILE_READING_CHUNK_SIZE }),
+            zlib.createGunzip({ chunkSize: Defaults.FILE_READING_CHUNK_SIZE }),
+            new stream.Writable({
+              write: (_chunk, _enc, cb): void => {
+                cb();
+              },
+            }),
+          );
 
           // Overwrite the real file with the temp file
           await FsUtil.mv(tempFile, this.filePath);

@@ -35,7 +35,7 @@ export default class MovedROMDeleter extends Module {
   async delete(
     indexedRoms: IndexedFiles,
     movedWriteCandidates: WriteCandidate[],
-    writtenFilesToExclude: File[],
+    writtenFilePathsToExclude: string[],
   ): Promise<string[]> {
     if (!this.options.shouldMove()) {
       // We shouldn't cause any change to the output directory
@@ -52,8 +52,9 @@ export default class MovedROMDeleter extends Module {
     // Get a count of all unique input file paths
     const inputFiles = new Set<string>();
     for (const candidate of movedWriteCandidates) {
-      for (const romWithFiles of candidate.getRomsWithFiles())
+      for (const romWithFiles of candidate.getRomsWithFiles()) {
         inputFiles.add(romWithFiles.getInputFile().getFilePath());
+      }
     }
     this.progressBar.resetProgress(inputFiles.size);
     this.prefixedLogger.trace(
@@ -93,7 +94,9 @@ export default class MovedROMDeleter extends Module {
           );
         }
 
-        for (const duplicate of possibleDuplicates) movedRoms.add(duplicate);
+        for (const duplicate of possibleDuplicates) {
+          movedRoms.add(duplicate);
+        }
       }
     }
     this.prefixedLogger.trace(
@@ -107,7 +110,7 @@ export default class MovedROMDeleter extends Module {
 
     const filePathsToDelete = MovedROMDeleter.filterOutWrittenFiles(
       fullyConsumedFiles,
-      writtenFilesToExclude,
+      writtenFilePathsToExclude,
     );
     this.prefixedLogger.trace(
       `filtered to ${IntlUtil.toLocaleString(filePathsToDelete.length)} non-output files`,
@@ -172,7 +175,7 @@ export default class MovedROMDeleter extends Module {
     // For each moved input path
     return [...groupedMovedRoms]
       .map(([filePath, movedEntries]) => {
-        if (movedEntries.length === 1 && !(movedEntries[0] instanceof ArchiveEntry)) {
+        if (movedEntries.length === 1 && !(movedEntries.at(0) instanceof ArchiveEntry)) {
           // The input file is either a plain File or an ArchiveFile; either way, it was fully moved
           return filePath;
         }
@@ -224,18 +227,16 @@ export default class MovedROMDeleter extends Module {
   }
 
   private static groupFilesByFilePath(files: File[]): Map<string, File[]> {
-    return files.reduce((map, file) => {
-      const key = file.getFilePath();
-      const filesForKey = map.get(key) ?? [];
-
-      filesForKey.push(file);
-      const uniqueFilesForKey = filesForKey.filter(
-        ArrayUtil.filterUniqueMapped((fileForKey) => fileForKey.toString()),
+    const filePathsToFiles = Map.groupBy(files, (file) => file.getFilePath());
+    for (const [filePath, filesForPath] of filePathsToFiles) {
+      filePathsToFiles.set(
+        filePath,
+        filesForPath.filter(
+          ArrayUtil.filterUniqueMapped((fileForPath) => fileForPath.getLocationKey()),
+        ),
       );
-
-      map.set(key, uniqueFilesForKey);
-      return map;
-    }, new Map<string, File[]>());
+    }
+    return filePathsToFiles;
   }
 
   /**
@@ -244,9 +245,9 @@ export default class MovedROMDeleter extends Module {
    */
   private static filterOutWrittenFiles(
     movedRoms: string[],
-    writtenFilesToExclude: File[],
+    writtenFilePathsToExclude: string[],
   ): string[] {
-    const writtenFilePaths = new Set(writtenFilesToExclude.map((file) => file.getFilePath()));
+    const writtenFilePaths = new Set(writtenFilePathsToExclude);
 
     return movedRoms.filter((filePath) => !writtenFilePaths.has(filePath));
   }

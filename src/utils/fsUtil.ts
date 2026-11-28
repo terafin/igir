@@ -12,9 +12,10 @@ import Defaults from '../globals/defaults.js';
 import gracefulFs from '../polyfill/gracefulFs.js';
 import type { FsReadCallback } from '../streams/fsReadTransform.js';
 import FsReadTransform from '../streams/fsReadTransform.js';
+import PathUtil from './pathUtil.js';
+import StreamUtil from './streamUtil.js';
 
 // Monkey-patch 'fs' to help prevent Windows EMFILE and other errors
-// eslint-disable-next-line unicorn/no-top-level-side-effects
 gracefulFs.gracefulify(fs);
 
 export const MoveResult = {
@@ -37,7 +38,32 @@ export type FsWalkCallback = (increment: number) => void;
  * A collection of static filesystem utility functions.
  */
 export default class FsUtil {
-  private static readonly SIZE_READABLE_SUFFIXES = ['', 'K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y'];
+  private static readonly SIZE_READABLE_SUFFIXES_DECIMAL = [
+    'B',
+    'kB',
+    'MB',
+    'GB',
+    'TB',
+    'PB',
+    'EB',
+    'ZB',
+    'YB',
+    'RB',
+    'QB',
+  ];
+  private static readonly SIZE_READABLE_SUFFIXES_BINARY = [
+    'B',
+    'KiB',
+    'MiB',
+    'GiB',
+    'TiB',
+    'PiB',
+    'EiB',
+    'ZiB',
+    'YiB',
+    'RiB',
+    'QiB',
+  ];
 
   /**
    * @param dirPath the path to a temporary directory
@@ -107,8 +133,13 @@ export default class FsUtil {
    * is writable.
    */
   static async copyFile(src: string, dest: string, callback?: FsReadCallback): Promise<void> {
-    if (!(await this.exists(src))) {
-      throw new IgirException(`can't copy nonexistent file '${src}' to '${dest}'`);
+    let srcSize: number;
+    try {
+      srcSize = (await fs.promises.stat(src)).size;
+    } catch (error) {
+      throw new IgirException(`can't copy nonexistent file '${src}' to '${dest}'`, {
+        cause: error,
+      });
     }
     const destDir = path.dirname(dest);
     if (!(await this.exists(destDir))) {
@@ -118,7 +149,7 @@ export default class FsUtil {
     const didDestPreviouslyExist = await this.exists(dest);
 
     const readStream = fs.createReadStream(src, {
-      highWaterMark: Defaults.FILE_READING_CHUNK_SIZE,
+      highWaterMark: StreamUtil.getChunkSize(0, undefined, srcSize),
     });
     const writeStream = fs.createWriteStream(dest);
     if (callback) {
@@ -183,7 +214,7 @@ export default class FsUtil {
    * Create a hardlink at location {@link link} to the original file {@link target}.
    */
   static async hardlink(target: string, link: string): Promise<void> {
-    const targetResolved = path.resolve(target);
+    const targetResolved = PathUtil.resolve(target);
 
     if (!(await this.exists(targetResolved))) {
       throw new IgirException(`can't link nonexistent file '${targetResolved}' to '${link}'`);
@@ -201,7 +232,9 @@ export default class FsUtil {
       return;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EXDEV') {
-        throw new IgirException(`can't hard link files on different drives: ${error}`);
+        throw new IgirException(`can't hard link files on different drives: ${error}`, {
+          cause: error,
+        });
       }
       throw error;
     }
@@ -289,7 +322,7 @@ export default class FsUtil {
    * @returns if {@link filePath} is on a samba path
    */
   static isSamba(filePath: string): boolean {
-    const resolvedPath = path.resolve(filePath);
+    const resolvedPath = PathUtil.resolve(filePath);
     if (resolvedPath === os.devNull) {
       return false;
     }
@@ -345,17 +378,40 @@ export default class FsUtil {
   }
 
   /**
-   * @returns a new filepath with all illegal characters removed
+   * @returns true if {@link filePath} would escape the directory that it's meant to be relative
+   * to, either because it's absolute or because it contains `..` path segments.
+   * https://security.snyk.io/research/zip-slip-vulnerability
    */
-  static makeLegal(filePath: string, pathSep = path.sep): string {
+  static isPathTraversal(filePath: string): boolean {
+    const normalized = filePath.replaceAll('\\', '/');
+    return (
+      // Absolute POSIX paths, as well as Windows UNC paths
+      normalized.startsWith('/') ||
+      // Windows drive letters
+      /^[a-z]:/i.test(normalized) ||
+      // Note: only whole segments count, filenames such as "Final Fantasy VII..disc1.bin" are legal
+      normalized.split('/').includes('..')
+    );
+  }
+
+  /**
+   * @returns a new filepath with all characters that are illegal on {@link platform} removed
+   */
+  static makeLegal(filePath: string, platform: NodeJS.Platform = process.platform): string {
+    if (platform !== 'win32') {
+      // POSIX filesystems only reserve the path separator, so the only change needed is to
+      // normalize the path separators
+      return filePath.replaceAll(/[\\/]/g, '/');
+    }
+
     return (
       filePath
-        // Make the filename Windows legal
+        // Windows reserves the colon for drive letters and alternate data streams
         .replaceAll(':', ';')
-        // Make the filename everything else legal
-        .replaceAll(/[<>:"|?*]/g, '_')
+        // Make the filename Windows legal
+        .replaceAll(/[<>"|?*]/g, '_')
         // Normalize the path separators
-        .replaceAll(/[\\/]/g, pathSep)
+        .replaceAll(/[\\/]/g, '\\')
         // Revert the Windows drive letter
         .replace(/^([a-z]);\\/i, '$1:\\')
     );
@@ -506,10 +562,10 @@ export default class FsUtil {
       await fs.promises.copyFile(src, dest, fs.constants.COPYFILE_FICLONE);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOTSUP') {
-        throw new IgirException('reflinks are not supported on this filesystem');
+        throw new IgirException('reflinks are not supported on this filesystem', { cause: error });
       }
       if ((error as NodeJS.ErrnoException).code === 'EXDEV') {
-        throw new IgirException('reflinks are not supported across filesystems');
+        throw new IgirException('reflinks are not supported across filesystems', { cause: error });
       }
       throw error;
     }
@@ -609,7 +665,7 @@ export default class FsUtil {
     const i = bytes === 0 ? 0 : Math.floor(Math.log(bytes) / Math.log(k));
     const bytesDivided = bytes / k ** i;
     if (Number.isSafeInteger(bytesDivided)) {
-      return `${bytesDivided}${this.SIZE_READABLE_SUFFIXES[i]}${i > 0 && k === 1024 ? 'i' : ''}B`;
+      return `${bytesDivided}${k === 1024 ? this.SIZE_READABLE_SUFFIXES_BINARY[i] : this.SIZE_READABLE_SUFFIXES_DECIMAL[i]}`;
     }
     let fractionDigits = 1;
     if (bytesDivided === 0) {
@@ -624,7 +680,7 @@ export default class FsUtil {
     ) {
       fractionDigits = 0;
     }
-    return `${bytesDivided.toFixed(fractionDigits)}${this.SIZE_READABLE_SUFFIXES[i]}${i > 0 && k === 1024 ? 'i' : ''}B`;
+    return `${bytesDivided.toFixed(fractionDigits)}${k === 1024 ? this.SIZE_READABLE_SUFFIXES_BINARY[i] : this.SIZE_READABLE_SUFFIXES_DECIMAL[i]}`;
   }
 
   /**

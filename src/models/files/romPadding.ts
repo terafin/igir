@@ -1,6 +1,8 @@
 import { Expose, instanceToPlain, plainToInstance } from 'class-transformer';
 
+import IgirException from '../../exceptions/igirException.js';
 import FsReadTransform, { FsReadCallback } from '../../streams/fsReadTransform.js';
+import PadEndTransform from '../../streams/padEndTransform.js';
 import StreamUtil from '../../utils/streamUtil.js';
 import File from './file.js';
 import FileChecksums from './fileChecksums.js';
@@ -95,17 +97,23 @@ export default class ROMPadding implements ROMPaddingProps {
    * up to the next power-of-two size with each of the known fill bytes.
    */
   static async paddingsFromFile(file: File, callback?: FsReadCallback): Promise<ROMPadding[]> {
-    const paddedSize = Math.pow(2, Math.ceil(Math.log(file.getSize()) / Math.log(2)));
-    if (paddedSize === file.getSize()) {
+    const fileSize = file.getSize();
+    if (fileSize === undefined) {
+      return [];
+    }
+
+    const paddedSize = Math.pow(2, Math.ceil(Math.log(fileSize) / Math.log(2)));
+    if (paddedSize === fileSize) {
       // The file isn't trimmed
       return [];
     }
 
     if (callback !== undefined) {
-      callback(0, paddedSize);
+      // The padding is generated, only the file's own bytes are read
+      callback(0, fileSize);
     }
 
-    return await file.createReadStream(async (readable) => {
+    return await file.extractToStream(async (readable) => {
       const readableWithCallback =
         callback === undefined
           ? readable
@@ -113,13 +121,26 @@ export default class ROMPadding implements ROMPaddingProps {
 
       const splitStreams = StreamUtil.split(readableWithCallback, this.POSSIBLE_FILL_BYTES.length);
 
-      return await Promise.all(
-        this.POSSIBLE_FILL_BYTES.map(async (fillByte, idx) => {
-          const paddedStream = StreamUtil.padEnd(splitStreams[idx], paddedSize, fillByte);
-          const checksums = await FileChecksums.hashStream(paddedStream, file.getChecksumBitmask());
-          return new ROMPadding({ paddedSize: paddedSize, fillByte, ...checksums });
-        }),
-      );
+      try {
+        return await Promise.all(
+          this.POSSIBLE_FILL_BYTES.map(async (fillByte, idx) => {
+            const splitStream = splitStreams.at(idx);
+            if (splitStream === undefined) {
+              throw new IgirException(`missing split stream for fill byte ${fillByte}`);
+            }
+            const checksums = await StreamUtil.pipelineSafe(
+              splitStream,
+              new PadEndTransform(paddedSize, fillByte),
+              async (padded) => await FileChecksums.hashStream(padded, file.getChecksumBitmask()),
+            );
+            return new ROMPadding({ paddedSize: paddedSize, fillByte, ...checksums });
+          }),
+        );
+      } finally {
+        for (const splitStream of splitStreams) {
+          splitStream.destroy();
+        }
+      }
     });
   }
 }

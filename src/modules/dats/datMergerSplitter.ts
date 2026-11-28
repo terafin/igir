@@ -185,6 +185,11 @@ export default class DATMergerSplitter extends Module {
     }
 
     // For 'merged' we reduce to one game
+    const [firstParentGame] = parentGames;
+    if (firstParentGame === undefined) {
+      // There's no parent to merge the clones into
+      return cloneGames;
+    }
     const cloneRoms = cloneGames.flatMap((game) =>
       game.getRoms().map(
         (rom) =>
@@ -206,14 +211,14 @@ export default class DATMergerSplitter extends Module {
       ...parentGames.flatMap((parentGame) => parentGame.getDisks()),
     ].filter(ArrayUtil.filterUniqueMapped((disk) => disk.getName()));
     return [
-      parentGames[0].withProps({
+      firstParentGame.withProps({
         roms: allRomsDeduplicated,
         disks: allDisksDeduplicated,
       }),
     ];
   }
 
-  private static diffGameRoms(parentRoms: ROM[], childRoms: ROM[]): ROM[] {
+  private static diffGameRoms<T extends ROM>(parentRoms: T[], childRoms: T[]): T[] {
     const parentRomNamesToHashCodes = parentRoms.reduce((map, rom) => {
       map.set(rom.getName(), rom.hashCode());
       return map;

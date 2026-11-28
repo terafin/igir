@@ -20,7 +20,11 @@ async function runCombinedCandidateGenerator(
   romFiles: File[],
 ): Promise<WriteCandidate[]> {
   // Run DATGameInferrer, but condense all DATs down to one
-  const dats = await new DATGameInferrer(options, new ProgressBarFake()).infer(romFiles);
+  const dats = await new DATGameInferrer(
+    options,
+    new ProgressBarFake(),
+    new MappableSemaphore(os.availableParallelism()),
+  ).infer(romFiles);
   const dat = new DATCombiner(new ProgressBarFake()).combine(dats);
 
   const indexedRomFiles = new ROMIndexer(options, new ProgressBarFake()).index(romFiles);
@@ -85,5 +89,5 @@ it('should combine candidates', async () => {
 
   // And the one candidate has all the ROMs
   expect(candidates).toHaveLength(1);
-  expect(candidates[0].getRomsWithFiles()).toHaveLength(romFiles.length);
+  expect(candidates.at(0)?.getRomsWithFiles()).toHaveLength(romFiles.length);
 });

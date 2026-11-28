@@ -1,9 +1,9 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import type { Readable } from 'node:stream';
 import stream from 'node:stream';
 import zlib from 'node:zlib';
 
+import StreamUtil from '../../../src/utils/streamUtil.js';
 import CompressedTransform from './compressedTransform.js';
 import CP437Encoder from './cp437Encoder.js';
 import type { ProgressCallback } from './progressTransform.js';
@@ -77,18 +77,21 @@ export default class TZWriter {
   }
 
   /**
-   * Add a stream to the TorrentZip.
+   * Add a stream to the TorrentZip. An {@link uncompressedSize} of undefined means the size isn't
+   * known ahead of time, the stream is then compressed and is assumed to not need Zip64.
    */
   async addStream(
     readable: Readable,
     filename: string,
-    uncompressedSize: number,
+    uncompressedSize: number | undefined,
     compressorThreads: number,
     progressCallback?: ProgressCallback,
   ): Promise<void> {
+    const isZip64 = uncompressedSize !== undefined && uncompressedSize >= 0xff_ff_ff_ff;
+
     // Figure out how long the local file header will be
     let localFileHeaderPlaceholder: Buffer<ArrayBuffer>;
-    if (uncompressedSize >= 0xff_ff_ff_ff) {
+    if (isZip64) {
       localFileHeaderPlaceholder = this.zip64LocalFileHeader(filename, this.filePosition);
     } else {
       localFileHeaderPlaceholder = this.localFileHeader(filename);
@@ -117,16 +120,15 @@ export default class TZWriter {
       new ProgressTransform(progressCallback),
       compressorTransform,
       compressedTransform,
-      fs.createWriteStream(os.devNull, {
-        fd: this.fileHandle.fd,
-        autoClose: false,
-        start: this.filePosition + localFileHeaderPlaceholder.length,
-      }),
+      StreamUtil.nonClosingWritable(
+        this.fileHandle,
+        this.filePosition + localFileHeaderPlaceholder.length,
+      ),
     );
 
     // Write the final local file header
     let localFileHeader: Buffer<ArrayBuffer>;
-    if (uncompressedSize >= 0xff_ff_ff_ff) {
+    if (isZip64) {
       localFileHeader = this.zip64LocalFileHeader(
         filename,
         this.filePosition,

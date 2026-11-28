@@ -1,3 +1,4 @@
+import assert from 'node:assert';
 import type { Stats } from 'node:fs';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -40,6 +41,7 @@ import ROMIndexer from '../../../src/modules/roms/romIndexer.js';
 import ROMScanner from '../../../src/modules/roms/romScanner.js';
 import ROMTrimProcessor from '../../../src/modules/roms/romTrimProcessor.js';
 import FsUtil, { WalkMode } from '../../../src/utils/fsUtil.js';
+import PathUtil from '../../../src/utils/pathUtil.js';
 import ProgressBarFake from '../../console/progressBarFake.js';
 
 async function copyFixturesToTemp(
@@ -122,7 +124,7 @@ async function candidateWriter(
       readerSemaphore,
     ).scan(Object.values(ChecksumBitmask).reduce((accum: number, bitmask) => accum | bitmask, 0));
   } catch {
-    /* ignored */
+    // ignored
   }
   const romFilesWithHeaders = await new ROMHeaderProcessor(
     options,
@@ -150,7 +152,11 @@ async function candidateWriter(
     ).scan();
     dat = new DATCombiner(new ProgressBarFake()).combine(scannedDats);
   } else {
-    const dats = await new DATGameInferrer(options, new ProgressBarFake()).infer(romFiles);
+    const dats = await new DATGameInferrer(
+      options,
+      new ProgressBarFake(),
+      new MappableSemaphore(os.availableParallelism()),
+    ).infer(romFiles);
     dat = new DATCombiner(new ProgressBarFake()).combine(dats);
   }
 
@@ -316,8 +322,8 @@ describe.each(['raw', 'extract', 'zip'])('%s', (command) => {
 
       // Then the output was touched
       const outputFilesAfter = await walkAndStat(outputTemp);
-      expect(outputFilesAfter.map((pair) => pair[0])).toEqual(
-        outputFilesBefore.map((pair) => pair[0]),
+      expect(outputFilesAfter.map(([filePath]) => filePath)).toEqual(
+        outputFilesBefore.map(([filePath]) => filePath),
       );
       expect(outputFilesAfter).not.toEqual(outputFilesBefore);
 
@@ -402,8 +408,8 @@ describe.each(['raw', 'extract', 'zip'])('%s', (command) => {
 
       // Then the output was touched
       const outputFilesAfter = await walkAndStat(outputTemp);
-      expect(outputFilesAfter.map((pair) => pair[0])).toEqual(
-        outputFilesBefore.map((pair) => pair[0]),
+      expect(outputFilesAfter.map(([filePath]) => filePath)).toEqual(
+        outputFilesBefore.map(([filePath]) => filePath),
       );
       expect(outputFilesAfter).not.toEqual(outputFilesBefore);
 
@@ -529,11 +535,14 @@ describe('zip', () => {
         await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
         const outputFiles = await walkAndStat(outputTemp);
         expect(outputFiles).toHaveLength(1);
+        const [firstOutputFile] = outputFiles;
+        assert.ok(firstOutputFile !== undefined);
+        const [firstOutputFilePath] = firstOutputFile;
         const archiveEntries = await new FileFactory(new FileCache()).filesFrom(
-          path.join(outputTemp, outputFiles[0][0]),
+          path.join(outputTemp, firstOutputFilePath),
         );
         expect(archiveEntries).toHaveLength(1);
-        const archiveEntry = archiveEntries[0] as ArchiveEntry<Archive>;
+        const archiveEntry = archiveEntries.at(0) as ArchiveEntry<Archive>;
         expect(archiveEntry.getEntryPath()).toEqual(expectedFileName);
         expect(archiveEntry.getCrc32()).toEqual(expectedCrc);
       });
@@ -562,62 +571,98 @@ describe('zip', () => {
       await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
       const outputFiles = await walkAndStat(outputTemp);
       expect(outputFiles).toHaveLength(1);
+      const [firstOutputFile] = outputFiles;
+      assert.ok(firstOutputFile !== undefined);
+      const [firstOutputFilePath] = firstOutputFile;
       const archiveEntries = await new FileFactory(new FileCache()).filesFrom(
-        path.join(outputTemp, outputFiles[0][0]),
+        path.join(outputTemp, firstOutputFilePath),
       );
       expect(archiveEntries).toHaveLength(1);
-      const archiveEntry = archiveEntries[0] as ArchiveEntry<Archive>;
+      const archiveEntry = archiveEntries.at(0) as ArchiveEntry<Archive>;
       expect(archiveEntry.getEntryPath()).toEqual(expectedFileName);
       expect(archiveEntry.getCrc32()).toEqual(expectedCrc);
     });
   });
 
-  test.each([
-    // Control group of files without patches
-    ['raw/empty.rom', [['empty.zip|empty.rom', '00000000']]],
-    ['raw/fizzbuzz.nes', [['fizzbuzz.zip|fizzbuzz.nes', '370517b5']]],
-    ['raw/foobar.lnx', [['foobar.zip|foobar.lnx', 'b22c9747']]],
-    ['raw/loremipsum.rom', [['loremipsum.zip|loremipsum.rom', '70856527']]],
-    // Patchable files
-    [
-      'patchable/before.rom',
+  test.each(
+    (
       [
-        ['After.zip|After.rom', '4c8e44d4'],
-        ['before.zip|before.rom', '0361b321'],
-      ],
-    ],
-    [
-      'patchable/best.gz',
-      [
-        ['best.zip|best.rom', '1e3d78cf'],
-        ['Worst.zip|Worst.rom', '6ff9ef96'],
-      ],
-    ],
-  ])('should patch files if appropriate: %s', async (inputGlob, expectedFilesAndCrcs) => {
-    await copyFixturesToTemp(async (inputTemp, outputTemp) => {
-      const options = new Options({
-        commands: ['copy', 'zip', 'test'],
-      });
-      await candidateWriter(options, inputTemp, inputGlob, 'patches', outputTemp);
-      const outputFiles = await walkAndStat(outputTemp);
+        // Control group of files without patches
+        ['raw/empty.rom', [['empty.zip|empty.rom', '00000000']]],
+        ['raw/fizzbuzz.nes', [['fizzbuzz.zip|fizzbuzz.nes', '370517b5']]],
+        ['raw/foobar.lnx', [['foobar.zip|foobar.lnx', 'b22c9747']]],
+        ['raw/loremipsum.rom', [['loremipsum.zip|loremipsum.rom', '70856527']]],
+        // Patchable files
+        [
+          'patchable/modify.rom',
+          [
+            ['modify-aps-gba.zip|modify-aps-gba.rom', '700a409c'],
+            ['modify-aps-n64.zip|modify-aps-n64.rom', '700a409c'],
+            ['modify-bps.zip|modify-bps.rom', '700a409c'],
+            ['modify-bsdiff.zip|modify-bsdiff.rom', '700a409c'],
+            ['modify-dps.zip|modify-dps.rom', '700a409c'],
+            ['modify-ebp.zip|modify-ebp.rom', '700a409c'],
+            ['modify-ips.zip|modify-ips.rom', '700a409c'],
+            ['modify-ips32.zip|modify-ips32.rom', '700a409c'],
+            ['modify-ninja.zip|modify-ninja.rom', '700a409c'],
+            ['modify-ppf.zip|modify-ppf.rom', '700a409c'],
+            ['modify-ups.zip|modify-ups.rom', '700a409c'],
+            ['modify-vcdiff.zip|modify-vcdiff.rom', '700a409c'],
+            ['modify.zip|modify.rom', 'aabfe90e'],
+          ],
+        ],
+        [
+          'patchable/shrink.gz',
+          [
+            ['shrink-aps-gba.zip|shrink-aps-gba.rom', 'c1f21914'],
+            ['shrink-aps-n64.zip|shrink-aps-n64.rom', 'c1f21914'],
+            ['shrink-bps.zip|shrink-bps.rom', 'c1f21914'],
+            ['shrink-bsdiff.zip|shrink-bsdiff.rom', 'c1f21914'],
+            ['shrink-dps.zip|shrink-dps.rom', 'c1f21914'],
+            ['shrink-ips.zip|shrink-ips.rom', 'c1f21914'],
+            ['shrink-ninja.zip|shrink-ninja.rom', 'c1f21914'],
+            ['shrink-ups.zip|shrink-ups.rom', 'c1f21914'],
+            ['shrink-vcdiff.zip|shrink-vcdiff.rom', 'c1f21914'],
+            ['shrink.zip|shrink.rom', '52249184'],
+          ],
+        ],
+      ] satisfies [string, string[][]][]
+    ).flatMap(([inputGlob, expectedFilesAndCrcs]) =>
+      // Patches should apply the same whether they're raw or inside an archive
+      ['patches', 'patches-zipped'].map((patchGlob): [string, string, string[][]] => [
+        inputGlob,
+        patchGlob,
+        expectedFilesAndCrcs,
+      ]),
+    ),
+  )(
+    'should patch files if appropriate: %s with %s',
+    async (inputGlob, patchGlob, expectedFilesAndCrcs) => {
+      await copyFixturesToTemp(async (inputTemp, outputTemp) => {
+        const options = new Options({
+          commands: ['copy', 'zip', 'test'],
+        });
+        await candidateWriter(options, inputTemp, inputGlob, patchGlob, outputTemp);
+        const outputFiles = await walkAndStat(outputTemp);
 
-      const writtenRomsAndCrcs = (
-        await Promise.all(
-          outputFiles.map(
-            async ([outputPath]) =>
-              await new FileFactory(new FileCache()).filesFrom(path.join(outputTemp, outputPath)),
-          ),
+        const writtenRomsAndCrcs = (
+          await Promise.all(
+            outputFiles.map(
+              async ([outputPath]) =>
+                await new FileFactory(new FileCache()).filesFrom(path.join(outputTemp, outputPath)),
+            ),
+          )
         )
-      )
-        .flat()
-        .map((entry) => [
-          entry.toString().replace(outputTemp + path.sep, ''),
-          entry.getCrc32() ?? '',
-        ])
-        .toSorted((a, b) => a[0].localeCompare(b[0]));
-      expect(writtenRomsAndCrcs).toEqual(expectedFilesAndCrcs);
-    });
-  });
+          .flat()
+          .map((entry): [string, string] => [
+            entry.toString().replace(outputTemp + path.sep, ''),
+            entry.getCrc32() ?? '',
+          ])
+          .toSorted(([aKey], [bKey]) => aKey.localeCompare(bKey));
+        expect(writtenRomsAndCrcs).toEqual(expectedFilesAndCrcs);
+      });
+    },
+  );
 
   test.each([
     [
@@ -625,7 +670,6 @@ describe('zip', () => {
       [
         path.join('2048', '2048.chd'), // <disk>
         path.join('4096', '4096.chd'), // <disk>
-        'best.zip',
         'CD-ROM.zip',
         path.join('CD-ROM', 'CD-ROM.chd'), // <disk>
         'fizzbuzz.zip',
@@ -639,7 +683,9 @@ describe('zip', () => {
         'one.zip',
         'onetwothree.zip',
         'patchable.zip',
+        'pmsr.zip',
         'raw.zip',
+        'shrink.zip',
         'three.zip',
         'two.zip',
         'UMD.zip',
@@ -717,7 +763,7 @@ describe('zip', () => {
       // When
       await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
       const outputFiles = (await walkAndStat(outputTemp))
-        .map((pair) => pair[0])
+        .map(([filePath]) => filePath)
         .toSorted((a, b) => a.localeCompare(b));
 
       // Then the expected files were written
@@ -734,7 +780,6 @@ describe('zip', () => {
       [
         path.join('2048', '2048.chd'), // <disk>
         path.join('4096', '4096.chd'), // <disk>
-        'best.zip',
         'CD-ROM.zip',
         path.join('CD-ROM', 'CD-ROM.chd'), // <disk>
         'fizzbuzz.zip',
@@ -748,7 +793,9 @@ describe('zip', () => {
         'one.zip',
         'onetwothree.zip',
         'patchable.zip',
+        'pmsr.zip',
         'raw.zip',
+        'shrink.zip',
         'three.zip',
         'two.zip',
         'UMD.zip',
@@ -845,7 +892,7 @@ describe('zip', () => {
         // When
         await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
         const outputFiles = (await walkAndStat(outputTemp))
-          .map((pair) => pair[0])
+          .map(([filePath]) => filePath)
           .toSorted((a, b) => a.localeCompare(b));
 
         // Then the expected files were written
@@ -875,7 +922,6 @@ describe('zip', () => {
     [
       '**/!(chd)/*',
       [
-        ['igir combined.zip|best.rom', '1e3d78cf'],
         ['igir combined.zip|CD-ROM/CD-ROM (Track 1).bin', '49ca35fb'],
         ['igir combined.zip|CD-ROM/CD-ROM (Track 2).bin', '0316f720'],
         ['igir combined.zip|CD-ROM/CD-ROM (Track 3).bin', 'a320af40'],
@@ -905,14 +951,11 @@ describe('zip', () => {
         ['igir combined.zip|onetwothree/1/one.rom', 'f817a89f'],
         ['igir combined.zip|onetwothree/2/two.rom', '96170874'],
         ['igir combined.zip|onetwothree/3/three.rom', 'ff46c5d8'],
-        ['igir combined.zip|patchable/0F09A40.rom', '2f943e86'],
-        ['igir combined.zip|patchable/3708F2C.rom', '20891c9f'],
-        ['igir combined.zip|patchable/612644F.rom', 'f7591b29'],
-        ['igir combined.zip|patchable/65D1206.rom', '20323455'],
-        ['igir combined.zip|patchable/92C85C9.rom', '06692159'],
-        ['igir combined.zip|patchable/before.rom', '0361b321'],
-        ['igir combined.zip|patchable/C01173E.rom', 'dfaebe28'],
-        ['igir combined.zip|patchable/KDULVQN.rom', 'b1c303e4'],
+        ['igir combined.zip|patchable/grow.rom', '1a4b9b3c'],
+        ['igir combined.zip|patchable/large.rom', '58263663'],
+        ['igir combined.zip|patchable/lzma.rom', 'c61fec0e'],
+        ['igir combined.zip|patchable/modify.rom', 'aabfe90e'],
+        ['igir combined.zip|pmsr.rom', 'a7f5cd7e'],
         ['igir combined.zip|raw/empty.rom', '00000000'],
         ['igir combined.zip|raw/five.rom', '3e5daf67'],
         ['igir combined.zip|raw/fizzbuzz.nes', '370517b5'],
@@ -924,6 +967,7 @@ describe('zip', () => {
         ['igir combined.zip|raw/trimmed.3ds', 'e964a5b3'],
         ['igir combined.zip|raw/two.rom', '96170874'],
         ['igir combined.zip|raw/unknown.rom', '377a7727'],
+        ['igir combined.zip|shrink.rom', '52249184'],
         ['igir combined.zip|speed_test_v51.sfc', '8beffd94'],
         ['igir combined.zip|three.rom', 'ff46c5d8'],
         ['igir combined.zip|two.rom', '96170874'],
@@ -961,13 +1005,16 @@ describe('zip', () => {
 
         // Then
         expect(outputFiles).toHaveLength(1);
-        const outputFile = path.join(outputTemp, outputFiles[0][0]);
+        const [firstOutputFile] = outputFiles;
+        assert.ok(firstOutputFile !== undefined);
+        const [firstOutputFilePath] = firstOutputFile;
+        const outputFile = path.join(outputTemp, firstOutputFilePath);
         const writtenRomsAndCrcs = (await new FileFactory(new FileCache()).filesFrom(outputFile))
-          .map((entry) => [
+          .map((entry): [string, string] => [
             entry.toString().replace(outputTemp + path.sep, ''),
             entry.getCrc32() ?? '',
           ])
-          .toSorted((a, b) => a[0].localeCompare(b[0]));
+          .toSorted(([aKey], [bKey]) => aKey.localeCompare(bKey));
         expect(writtenRomsAndCrcs).toEqual(expectedFilesAndCrcs);
       });
     },
@@ -996,9 +1043,12 @@ describe('extract', () => {
         await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
         const outputFiles = await walkAndStat(outputTemp);
         expect(outputFiles).toHaveLength(1);
-        expect(outputFiles[0][0]).toEqual(expectedFileName);
+        const [firstOutputFile] = outputFiles;
+        assert.ok(firstOutputFile !== undefined);
+        const [firstOutputFilePath] = firstOutputFile;
+        expect(firstOutputFilePath).toEqual(expectedFileName);
         const outputFile = await File.fileOf(
-          { filePath: path.join(outputTemp, outputFiles[0][0]) },
+          { filePath: path.join(outputTemp, firstOutputFilePath) },
           ChecksumBitmask.CRC32,
         );
         expect(outputFile.getCrc32()).toEqual(expectedCrc);
@@ -1028,9 +1078,12 @@ describe('extract', () => {
       await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
       const outputFiles = await walkAndStat(outputTemp);
       expect(outputFiles).toHaveLength(1);
-      expect(outputFiles[0][0]).toEqual(expectedFileName);
+      const [firstOutputFile] = outputFiles;
+      assert.ok(firstOutputFile !== undefined);
+      const [firstOutputFilePath] = firstOutputFile;
+      expect(firstOutputFilePath).toEqual(expectedFileName);
       const outputFile = await File.fileOf(
-        { filePath: path.join(outputTemp, outputFiles[0][0]) },
+        { filePath: path.join(outputTemp, firstOutputFilePath) },
         ChecksumBitmask.CRC32,
       );
       expect(outputFile.getCrc32()).toEqual(expectedCrc);
@@ -1045,17 +1098,36 @@ describe('extract', () => {
     ['raw/loremipsum.rom', [['loremipsum.rom', '70856527']]],
     // Patchable files
     [
-      'patchable/before.rom',
+      'patchable/modify.rom',
       [
-        ['After.rom', '4c8e44d4'],
-        ['before.rom', '0361b321'],
+        ['modify-aps-gba.rom', '700a409c'],
+        ['modify-aps-n64.rom', '700a409c'],
+        ['modify-bps.rom', '700a409c'],
+        ['modify-bsdiff.rom', '700a409c'],
+        ['modify-dps.rom', '700a409c'],
+        ['modify-ebp.rom', '700a409c'],
+        ['modify-ips.rom', '700a409c'],
+        ['modify-ips32.rom', '700a409c'],
+        ['modify-ninja.rom', '700a409c'],
+        ['modify-ppf.rom', '700a409c'],
+        ['modify-ups.rom', '700a409c'],
+        ['modify-vcdiff.rom', '700a409c'],
+        ['modify.rom', 'aabfe90e'],
       ],
     ],
     [
-      'patchable/best.gz',
+      'patchable/shrink.gz',
       [
-        ['best.rom', '1e3d78cf'],
-        ['Worst.rom', '6ff9ef96'],
+        ['shrink-aps-gba.rom', 'c1f21914'],
+        ['shrink-aps-n64.rom', 'c1f21914'],
+        ['shrink-bps.rom', 'c1f21914'],
+        ['shrink-bsdiff.rom', 'c1f21914'],
+        ['shrink-dps.rom', 'c1f21914'],
+        ['shrink-ips.rom', 'c1f21914'],
+        ['shrink-ninja.rom', 'c1f21914'],
+        ['shrink-ups.rom', 'c1f21914'],
+        ['shrink-vcdiff.rom', 'c1f21914'],
+        ['shrink.rom', '52249184'],
       ],
     ],
   ])('should patch files if appropriate: %s', async (inputGlob, expectedFilesAndCrcs) => {
@@ -1075,11 +1147,11 @@ describe('extract', () => {
         )
       )
         .flat()
-        .map((entry) => [
+        .map((entry): [string, string] => [
           entry.toString().replace(outputTemp + path.sep, ''),
           entry.getCrc32() ?? '',
         ])
-        .toSorted((a, b) => a[0].localeCompare(b[0]));
+        .toSorted(([aKey], [bKey]) => aKey.localeCompare(bKey));
       expect(writtenRomsAndCrcs).toEqual(expectedFilesAndCrcs);
     });
   });
@@ -1116,11 +1188,11 @@ describe('extract', () => {
         )
       )
         .flat()
-        .map((entry) => [
+        .map((entry): [string, string] => [
           entry.toString().replace(outputTemp + path.sep, ''),
           entry.getCrc32() ?? '',
         ])
-        .toSorted((a, b) => a[0].localeCompare(b[0]));
+        .toSorted(([aKey], [bKey]) => aKey.localeCompare(bKey));
       expect(writtenRomsAndCrcs).toEqual(expectedFilesAndCrcs);
     });
   });
@@ -1131,7 +1203,6 @@ describe('extract', () => {
       [
         '2048.chd', // <disk>
         '4096.chd', // <disk>
-        'best.rom',
         'CD-ROM.chd', // <disk>
         path.join('CD-ROM', 'CD-ROM (Track 1).bin'), // <disk>
         path.join('CD-ROM', 'CD-ROM (Track 2).bin'), // <disk>
@@ -1157,14 +1228,11 @@ describe('extract', () => {
         path.join('onetwothree', '1', 'one.rom'),
         path.join('onetwothree', '2', 'two.rom'),
         path.join('onetwothree', '3', 'three.rom'),
-        path.join('patchable', '0F09A40.rom'),
-        path.join('patchable', '3708F2C.rom'),
-        path.join('patchable', '612644F.rom'),
-        path.join('patchable', '65D1206.rom'),
-        path.join('patchable', '92C85C9.rom'),
-        path.join('patchable', 'before.rom'),
-        path.join('patchable', 'C01173E.rom'),
-        path.join('patchable', 'KDULVQN.rom'),
+        path.join('patchable', 'grow.rom'),
+        path.join('patchable', 'large.rom'),
+        path.join('patchable', 'lzma.rom'),
+        path.join('patchable', 'modify.rom'),
+        'pmsr.rom',
         path.join('raw', 'empty.rom'),
         path.join('raw', 'five.rom'),
         path.join('raw', 'fizzbuzz.nes'),
@@ -1176,6 +1244,7 @@ describe('extract', () => {
         path.join('raw', 'trimmed.3ds'),
         path.join('raw', 'two.rom'),
         path.join('raw', 'unknown.rom'),
+        'shrink.rom',
         'three.rom',
         'two.rom',
         'UMD.iso',
@@ -1264,7 +1333,7 @@ describe('extract', () => {
       // When
       await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
       const outputFiles = (await walkAndStat(outputTemp))
-        .map((pair) => pair[0])
+        .map(([filePath]) => filePath)
         .toSorted((a, b) => a.localeCompare(b));
 
       // Then the expected files were written
@@ -1281,7 +1350,6 @@ describe('extract', () => {
       [
         '2048.chd', // <disk>
         '4096.chd', // <disk>
-        'best.rom',
         'CD-ROM.chd', // <disk>
         path.join('CD-ROM', 'CD-ROM (Track 1).bin'), // <disk>
         path.join('CD-ROM', 'CD-ROM (Track 2).bin'), // <disk>
@@ -1307,14 +1375,11 @@ describe('extract', () => {
         path.join('onetwothree', '1', 'one.rom'),
         path.join('onetwothree', '2', 'two.rom'),
         path.join('onetwothree', '3', 'three.rom'),
-        path.join('patchable', '0F09A40.rom'),
-        path.join('patchable', '3708F2C.rom'),
-        path.join('patchable', '612644F.rom'),
-        path.join('patchable', '65D1206.rom'),
-        path.join('patchable', '92C85C9.rom'),
-        path.join('patchable', 'before.rom'),
-        path.join('patchable', 'C01173E.rom'),
-        path.join('patchable', 'KDULVQN.rom'),
+        path.join('patchable', 'grow.rom'),
+        path.join('patchable', 'large.rom'),
+        path.join('patchable', 'lzma.rom'),
+        path.join('patchable', 'modify.rom'),
+        'pmsr.rom',
         path.join('raw', 'empty.rom'),
         path.join('raw', 'five.rom'),
         path.join('raw', 'fizzbuzz.nes'),
@@ -1326,6 +1391,7 @@ describe('extract', () => {
         path.join('raw', 'trimmed.3ds'),
         path.join('raw', 'two.rom'),
         path.join('raw', 'unknown.rom'),
+        'shrink.rom',
         'three.rom',
         'two.rom',
         'UMD.iso',
@@ -1347,14 +1413,10 @@ describe('extract', () => {
         path.join('discs', 'track02.raw'),
         path.join('discs', 'track03.bin'),
         path.join('discs', 'track04.bin'),
-        path.join('patchable', '0F09A40.rom'),
-        path.join('patchable', '3708F2C.rom'),
-        path.join('patchable', '612644F.rom'),
-        path.join('patchable', '65D1206.rom'),
-        path.join('patchable', '92C85C9.rom'),
-        path.join('patchable', 'C01173E.rom'),
-        path.join('patchable', 'KDULVQN.rom'),
-        path.join('patchable', 'before.rom'),
+        path.join('patchable', 'grow.rom'),
+        path.join('patchable', 'large.rom'),
+        path.join('patchable', 'lzma.rom'),
+        path.join('patchable', 'modify.rom'),
         path.join('raw', 'empty.rom'),
         path.join('raw', 'five.rom'),
         path.join('raw', 'fizzbuzz.nes'),
@@ -1469,7 +1531,7 @@ describe('extract', () => {
         // When
         await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
         const outputFiles = (await walkAndStat(outputTemp))
-          .map((pair) => pair[0])
+          .map(([filePath]) => filePath)
           .toSorted((a, b) => a.localeCompare(b));
 
         // Then the expected files were written
@@ -1514,9 +1576,12 @@ describe('raw', () => {
         await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
         const outputFiles = await walkAndStat(outputTemp);
         expect(outputFiles).toHaveLength(1);
-        expect(outputFiles[0][0]).toEqual(expectedFileName);
+        const [firstOutputFile] = outputFiles;
+        assert.ok(firstOutputFile !== undefined);
+        const [firstOutputFilePath] = firstOutputFile;
+        expect(firstOutputFilePath).toEqual(expectedFileName);
         const outputFile = await File.fileOf(
-          { filePath: path.join(outputTemp, outputFiles[0][0]) },
+          { filePath: path.join(outputTemp, firstOutputFilePath) },
           ChecksumBitmask.CRC32,
         );
         expect(outputFile.getCrc32()).toEqual(expectedCrc);
@@ -1544,9 +1609,12 @@ describe('raw', () => {
         await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
         const outputFiles = await walkAndStat(outputTemp);
         expect(outputFiles).toHaveLength(1);
-        expect(outputFiles[0][0]).toEqual(expectedFileName);
+        const [firstOutputFile] = outputFiles;
+        assert.ok(firstOutputFile !== undefined);
+        const [firstOutputFilePath] = firstOutputFile;
+        expect(firstOutputFilePath).toEqual(expectedFileName);
         const outputFile = await File.fileOf(
-          { filePath: path.join(outputTemp, outputFiles[0][0]) },
+          { filePath: path.join(outputTemp, firstOutputFilePath) },
           ChecksumBitmask.CRC32,
         );
         expect(outputFile.getCrc32()).toEqual(expectedCrc);
@@ -1562,13 +1630,24 @@ describe('raw', () => {
     ['raw/loremipsum.rom', [['loremipsum.rom', '70856527']]],
     // Patchable files
     [
-      'patchable/before.rom',
+      'patchable/modify.rom',
       [
-        ['After.rom', '4c8e44d4'],
-        ['before.rom', '0361b321'],
+        ['modify-aps-gba.rom', '700a409c'],
+        ['modify-aps-n64.rom', '700a409c'],
+        ['modify-bps.rom', '700a409c'],
+        ['modify-bsdiff.rom', '700a409c'],
+        ['modify-dps.rom', '700a409c'],
+        ['modify-ebp.rom', '700a409c'],
+        ['modify-ips.rom', '700a409c'],
+        ['modify-ips32.rom', '700a409c'],
+        ['modify-ninja.rom', '700a409c'],
+        ['modify-ppf.rom', '700a409c'],
+        ['modify-ups.rom', '700a409c'],
+        ['modify-vcdiff.rom', '700a409c'],
+        ['modify.rom', 'aabfe90e'],
       ],
     ],
-    // Note: best.gz|best.rom can't be patched because we're raw copying
+    // Note: shrink.gz|shrink.rom can't be patched because we're raw copying
   ])('should patch files if appropriate: %s', async (inputGlob, expectedFilesAndCrcs) => {
     await copyFixturesToTemp(async (inputTemp, outputTemp) => {
       const options = new Options({
@@ -1586,11 +1665,11 @@ describe('raw', () => {
         )
       )
         .flat()
-        .map((entry) => [
+        .map((entry): [string, string] => [
           entry.toString().replace(outputTemp + path.sep, ''),
           entry.getCrc32() ?? '',
         ])
-        .toSorted((a, b) => a[0].localeCompare(b[0]));
+        .toSorted(([aKey], [bKey]) => aKey.localeCompare(bKey));
       expect(writtenRomsAndCrcs).toEqual(expectedFilesAndCrcs);
     });
   });
@@ -1601,28 +1680,36 @@ describe('raw', () => {
       [
         '2048.chd', // <disk> raw
         '4096.chd', // <disk> raw
-        'best.gz',
         'CD-ROM.chd', // <disk> raw
-        'fizzbuzz.zip',
-        'foobar.zip',
-        'fourfive.zip',
+        path.join('CD-ROM', 'CD-ROM (Track 1).bin'),
+        path.join('CD-ROM', 'CD-ROM (Track 2).bin'),
+        path.join('CD-ROM', 'CD-ROM (Track 3).bin'),
+        path.join('CD-ROM', 'CD-ROM.cue'),
+        'fizzbuzz.nes',
+        'foobar.lnx',
+        path.join('fourfive', 'five.rom'),
+        path.join('fourfive', 'four.rom'),
         'GameCube-240pSuite-1.19.gcz',
         'GD-ROM.chd', // <disk> raw
+        path.join('GD-ROM', 'GD-ROM.gdi'),
+        path.join('GD-ROM', 'track01.bin'),
+        path.join('GD-ROM', 'track02.raw'),
+        path.join('GD-ROM', 'track03.bin'),
+        path.join('GD-ROM', 'track04.bin'),
         'invalid.7z',
         'invalid.rar',
         'invalid.tar.gz',
         'invalid.zip',
-        'loremipsum.zip',
-        'one.gz',
-        'onetwothree.zip',
-        path.join('patchable', '0F09A40.rom'),
-        path.join('patchable', '3708F2C.rom'),
-        path.join('patchable', '612644F.rom'),
-        path.join('patchable', '65D1206.rom'),
-        path.join('patchable', '92C85C9.rom'),
-        path.join('patchable', 'before.rom'),
-        path.join('patchable', 'C01173E.rom'),
-        path.join('patchable', 'KDULVQN.rom'),
+        'loremipsum.rom',
+        'one.rom',
+        path.join('onetwothree', '1', 'one.rom'),
+        path.join('onetwothree', '2', 'two.rom'),
+        path.join('onetwothree', '3', 'three.rom'),
+        path.join('patchable', 'grow.rom'),
+        path.join('patchable', 'large.rom'),
+        path.join('patchable', 'lzma.rom'),
+        path.join('patchable', 'modify.rom'),
+        'pmsr.zip',
         path.join('raw', 'empty.rom'),
         path.join('raw', 'five.rom'),
         path.join('raw', 'fizzbuzz.nes'),
@@ -1634,10 +1721,11 @@ describe('raw', () => {
         path.join('raw', 'trimmed.3ds'),
         path.join('raw', 'two.rom'),
         path.join('raw', 'unknown.rom'),
-        'three.gz',
-        'two.gz',
-        'UMD.cso',
-        'unknown.zip',
+        'shrink.gz',
+        'three.rom',
+        'two.rom',
+        'UMD.iso',
+        'unknown.rom',
       ],
     ],
     [
@@ -1704,7 +1792,7 @@ describe('raw', () => {
       // When
       await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
       const outputFiles = (await walkAndStat(outputTemp))
-        .map((pair) => pair[0])
+        .map(([filePath]) => filePath)
         .toSorted((a, b) => a.localeCompare(b));
 
       // Then the expected files were written
@@ -1721,28 +1809,36 @@ describe('raw', () => {
       [
         '2048.chd', // <disk> raw
         '4096.chd', // <disk> raw
-        'best.gz',
         'CD-ROM.chd', // <disk> raw
-        'fizzbuzz.zip',
-        'foobar.zip',
-        'fourfive.zip',
+        path.join('CD-ROM', 'CD-ROM (Track 1).bin'),
+        path.join('CD-ROM', 'CD-ROM (Track 2).bin'),
+        path.join('CD-ROM', 'CD-ROM (Track 3).bin'),
+        path.join('CD-ROM', 'CD-ROM.cue'),
+        'fizzbuzz.nes',
+        'foobar.lnx',
+        path.join('fourfive', 'five.rom'),
+        path.join('fourfive', 'four.rom'),
         'GameCube-240pSuite-1.19.gcz',
         'GD-ROM.chd', // <disk> raw
+        path.join('GD-ROM', 'GD-ROM.gdi'),
+        path.join('GD-ROM', 'track01.bin'),
+        path.join('GD-ROM', 'track02.raw'),
+        path.join('GD-ROM', 'track03.bin'),
+        path.join('GD-ROM', 'track04.bin'),
         'invalid.7z',
         'invalid.rar',
         'invalid.tar.gz',
         'invalid.zip',
-        'loremipsum.zip',
-        'one.gz',
-        'onetwothree.zip',
-        path.join('patchable', '0F09A40.rom'),
-        path.join('patchable', '3708F2C.rom'),
-        path.join('patchable', '612644F.rom'),
-        path.join('patchable', '65D1206.rom'),
-        path.join('patchable', '92C85C9.rom'),
-        path.join('patchable', 'before.rom'),
-        path.join('patchable', 'C01173E.rom'),
-        path.join('patchable', 'KDULVQN.rom'),
+        'loremipsum.rom',
+        'one.rom',
+        path.join('onetwothree', '1', 'one.rom'),
+        path.join('onetwothree', '2', 'two.rom'),
+        path.join('onetwothree', '3', 'three.rom'),
+        path.join('patchable', 'grow.rom'),
+        path.join('patchable', 'large.rom'),
+        path.join('patchable', 'lzma.rom'),
+        path.join('patchable', 'modify.rom'),
+        'pmsr.zip',
         path.join('raw', 'empty.rom'),
         path.join('raw', 'five.rom'),
         path.join('raw', 'fizzbuzz.nes'),
@@ -1754,10 +1850,11 @@ describe('raw', () => {
         path.join('raw', 'trimmed.3ds'),
         path.join('raw', 'two.rom'),
         path.join('raw', 'unknown.rom'),
-        'three.gz',
-        'two.gz',
-        'UMD.cso',
-        'unknown.zip',
+        'shrink.gz',
+        'three.rom',
+        'two.rom',
+        'UMD.iso',
+        'unknown.rom',
       ],
       [
         path.join('7z', 'invalid.7z'),
@@ -1765,20 +1862,23 @@ describe('raw', () => {
         path.join('chd', '4096.chd'),
         path.join('chd', 'CD-ROM.chd'),
         path.join('chd', 'GD-ROM.chd'),
-        path.join('cso', 'UMD.cso'),
+        path.join('discs', 'CD-ROM (Track 1).bin'),
+        path.join('discs', 'CD-ROM (Track 2).bin'),
+        path.join('discs', 'CD-ROM (Track 3).bin'),
+        path.join('discs', 'CD-ROM.cue'),
+        path.join('discs', 'GD-ROM.gdi'),
+        path.join('discs', 'track01.bin'),
+        path.join('discs', 'track02.raw'),
+        path.join('discs', 'track03.bin'),
+        path.join('discs', 'track04.bin'),
+        path.join('discs', 'UMD.iso'),
         path.join('gcz', 'GameCube-240pSuite-1.19.gcz'),
-        path.join('gz', 'one.gz'),
-        path.join('gz', 'three.gz'),
-        path.join('gz', 'two.gz'),
-        path.join('patchable', '0F09A40.rom'),
-        path.join('patchable', '3708F2C.rom'),
-        path.join('patchable', '612644F.rom'),
-        path.join('patchable', '65D1206.rom'),
-        path.join('patchable', '92C85C9.rom'),
-        path.join('patchable', 'C01173E.rom'),
-        path.join('patchable', 'KDULVQN.rom'),
-        path.join('patchable', 'before.rom'),
-        path.join('patchable', 'best.gz'),
+        path.join('patchable', 'grow.rom'),
+        path.join('patchable', 'large.rom'),
+        path.join('patchable', 'lzma.rom'),
+        path.join('patchable', 'modify.rom'),
+        path.join('patchable', 'pmsr.zip'),
+        path.join('patchable', 'shrink.gz'),
         path.join('raw', 'empty.rom'),
         path.join('raw', 'five.rom'),
         path.join('raw', 'fizzbuzz.nes'),
@@ -1790,12 +1890,6 @@ describe('raw', () => {
         path.join('raw', 'trimmed.3ds'),
         path.join('raw', 'two.rom'),
         path.join('raw', 'unknown.rom'),
-        path.join('zip', 'fizzbuzz.zip'),
-        path.join('zip', 'foobar.zip'),
-        path.join('zip', 'fourfive.zip'),
-        path.join('zip', 'loremipsum.zip'),
-        path.join('zip', 'onetwothree.zip'),
-        path.join('zip', 'unknown.zip'),
       ],
     ],
     [
@@ -1910,7 +2004,7 @@ describe('raw', () => {
         // When
         await candidateWriter(options, inputTemp, inputGlob, undefined, outputTemp);
         const outputFiles = (await walkAndStat(outputTemp))
-          .map((pair) => pair[0])
+          .map(([filePath]) => filePath)
           .toSorted((a, b) => a.localeCompare(b));
 
         // Then the expected files were written
@@ -2024,8 +2118,8 @@ describe('link', () => {
 
         // Then the output was touched because the links were recreated
         const outputFilesAfter = await walkAndStat(outputTemp);
-        expect(outputFilesAfter.map((pair) => pair[0])).toEqual(
-          outputFilesBefore.map((pair) => pair[0]),
+        expect(outputFilesAfter.map(([filePath]) => filePath)).toEqual(
+          outputFilesBefore.map(([filePath]) => filePath),
         );
         /* eslint-disable vitest/no-conditional-expect */
         if (linkMode === LinkModeInverted[LinkMode.HARDLINK]) {
@@ -2090,8 +2184,8 @@ describe('link', () => {
 
         // Then the output was touched because the links were recreated
         const outputFilesAfter = await walkAndStat(outputTemp);
-        expect(outputFilesAfter.map((pair) => pair[0])).toEqual(
-          outputFilesBefore.map((pair) => pair[0]),
+        expect(outputFilesAfter.map(([filePath]) => filePath)).toEqual(
+          outputFilesBefore.map(([filePath]) => filePath),
         );
         /* eslint-disable vitest/no-conditional-expect */
         if (linkMode === LinkModeInverted[LinkMode.HARDLINK]) {
@@ -2129,8 +2223,8 @@ describe('link', () => {
       expect(outputFilesBefore.length).toBeGreaterThan(0);
       for (const [outputPath, stats] of outputFilesBefore) {
         expect(stats.isSymbolicLink()).toEqual(true);
-        const outputPathAbsolute = path.resolve(path.join(outputTemp, outputPath));
-        const outputPathResolved = path.resolve(
+        const outputPathAbsolute = PathUtil.resolve(path.join(outputTemp, outputPath));
+        const outputPathResolved = PathUtil.resolve(
           path.dirname(outputPathAbsolute),
           await FsUtil.readlink(outputPathAbsolute),
         );

@@ -2,7 +2,9 @@ import 'reflect-metadata';
 
 import { Expose, Transform, Type } from 'class-transformer';
 
+import IgirException from '../../exceptions/igirException.js';
 import ArrayUtil from '../../utils/arrayUtil.js';
+import FsUtil from '../../utils/fsUtil.js';
 import Disk from './disk.js';
 import Internationalization from './internationalization.js';
 import DeviceRef from './mame/deviceRef.js';
@@ -110,6 +112,10 @@ export interface GameProps {
 
   readonly genre?: string;
 
+  // ********** REDUMP FIELDS **********
+
+  // readonly serial?: string;
+
   // ********** IGIR FIELDS **********
 
   readonly dir2datSource?: string;
@@ -177,6 +183,12 @@ export default class Game implements GameProps {
   );
 
   @Expose()
+  @Transform(({ value }: { value: undefined | string }) => {
+    if (value !== undefined && FsUtil.isPathTraversal(value)) {
+      throw new IgirException(`game name is unsafe for directory traversal: ${value}`);
+    }
+    return value;
+  })
   readonly name: string;
 
   @Expose({ name: 'isbios' })
@@ -235,6 +247,9 @@ export default class Game implements GameProps {
   readonly language?: string;
 
   constructor(props?: GameProps) {
+    if (props?.name !== undefined && FsUtil.isPathTraversal(props.name)) {
+      throw new IgirException(`game name is unsafe for directory traversal: ${props.name}`);
+    }
     this.name = props?.name ?? '';
     this.isBios = props?.isBios ?? this.isBios;
     this.cloneOf = props?.cloneOf;
@@ -374,35 +389,33 @@ export default class Game implements GameProps {
   getRevision(): number {
     // Numeric revision
     const revNumberMatches = Game.REVISION_NUMBER_REGEX.exec(this.getName());
-    if (revNumberMatches && revNumberMatches.length >= 3 && !Number.isNaN(revNumberMatches[1])) {
-      return Number(revNumberMatches[2]);
+    if (revNumberMatches && revNumberMatches.length >= 3 && !Number.isNaN(revNumberMatches.at(1))) {
+      return Number(revNumberMatches.at(2));
     }
 
     // Letter revision
-    const revLetterMatches = Game.REVISION_LETTER_REGEX.exec(this.getName());
-    if (revLetterMatches && revLetterMatches.length >= 2) {
+    const revLetter = Game.REVISION_LETTER_REGEX.exec(this.getName())?.at(1);
+    if (revLetter !== undefined) {
       return (
-        (revLetterMatches[1].toUpperCase().codePointAt(0) as number) -
-        ('A'.codePointAt(0) as number) +
-        1
+        (revLetter.toUpperCase().codePointAt(0) as number) - ('A'.codePointAt(0) as number) + 1
       );
     }
 
     // TOSEC versions
     const versionMatches = Game.TOSEC_VERSION_REGEX.exec(this.getName());
-    if (versionMatches && versionMatches.length >= 2 && !Number.isNaN(versionMatches[1])) {
-      return Number(versionMatches[1]);
+    if (versionMatches && versionMatches.length >= 2 && !Number.isNaN(versionMatches.at(1))) {
+      return Number(versionMatches.at(1));
     }
 
     // Ring code revision
     const ringCodeMatches = Game.RING_CODE_REGEX.exec(this.getName());
     if (ringCodeMatches && ringCodeMatches.length >= 2) {
-      if (ringCodeMatches[1] === '') {
+      if (ringCodeMatches.at(1) === '') {
         // Redump doesn't always include a number
         return 1;
       }
-      if (!Number.isNaN(ringCodeMatches[1])) {
-        return Number(ringCodeMatches[1]);
+      if (!Number.isNaN(ringCodeMatches.at(1))) {
+        return Number(ringCodeMatches.at(1));
       }
     }
 
@@ -738,9 +751,9 @@ export default class Game implements GameProps {
       return [this.region];
     }
 
-    const longRegionsMatch = this.getName().match(Game.LONG_REGIONS_REGEX);
-    if (longRegionsMatch !== null) {
-      return longRegionsMatch[1]
+    const longRegions = this.getName().match(Game.LONG_REGIONS_REGEX)?.at(1);
+    if (longRegions !== undefined) {
+      return longRegions
         .toLowerCase()
         .split(/, ?/)
         .map(
@@ -799,9 +812,9 @@ export default class Game implements GameProps {
   }
 
   private getTwoLetterLanguagesFromName(): string[] {
-    const twoMatches = Game.TWO_LETTER_LANGUAGE_REGEX.exec(this.getName());
-    if (twoMatches && twoMatches.length >= 2) {
-      const twoMatchesParsed = twoMatches[1]
+    const twoLetterLanguages = Game.TWO_LETTER_LANGUAGE_REGEX.exec(this.getName())?.at(1);
+    if (twoLetterLanguages !== undefined) {
+      const twoMatchesParsed = twoLetterLanguages
         .replace(/-[a-zA-Z]+$/, '') // chop off country
         .split(/[,+]/)
         .map((lang) => lang.toUpperCase())
@@ -816,9 +829,9 @@ export default class Game implements GameProps {
 
   private getThreeLetterLanguagesFromName(): string[] {
     // Get language from long languages in the game name
-    const threeMatches = Game.THREE_LETTER_LANGUAGE_REGEX.exec(this.getName());
-    if (threeMatches && threeMatches.length >= 2) {
-      const threeMatchesParsed = threeMatches[1]
+    const threeLetterLanguages = Game.THREE_LETTER_LANGUAGE_REGEX.exec(this.getName())?.at(1);
+    if (threeLetterLanguages !== undefined) {
+      const threeMatchesParsed = threeLetterLanguages
         .split('-')
         .map((lang) => lang.toUpperCase())
         .map(

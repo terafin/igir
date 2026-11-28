@@ -21,7 +21,7 @@ import File from '../../models/files/file.js';
 import ZeroSizeFile from '../../models/files/zeroSizeFile.js';
 import type IndexedFiles from '../../models/indexedFiles.js';
 import type Options from '../../models/options.js';
-import { ZipFormat } from '../../models/options.js';
+import { PreferFiletype, ZipFormat } from '../../models/options.js';
 import ROMWithFiles from '../../models/romWithFiles.js';
 import WriteCandidate from '../../models/writeCandidate.js';
 import type { OutputPath } from '../../modules/candidates/utils/outputFactory.js';
@@ -76,9 +76,10 @@ export default class CandidateGenerator extends Module {
         let gameCandidates: WriteCandidate[] = [];
         try {
           gameCandidates = await this.buildCandidatesForGame(dat, game, indexedFiles);
-          if (gameCandidates.length > 0) {
+          const [firstGameCandidate] = gameCandidates;
+          if (firstGameCandidate !== undefined) {
             this.prefixedLogger.trace(
-              `${dat.getName()}: ${game.getName()}: found candidate: ${gameCandidates[0]
+              `${dat.getName()}: ${game.getName()}: found candidate: ${firstGameCandidate
                 .getRomsWithFiles()
                 .map((rwf) => rwf.getInputFile().toString())
                 .reduce(ArrayUtil.reduceUnique(), [])
@@ -182,6 +183,7 @@ export default class CandidateGenerator extends Module {
       dat,
       game,
       foundRomsWithFiles,
+      indexedFiles,
     );
     if (foundRomsWithArchiveFiles.length < foundRomsWithFiles.length) {
       // Some input files were filtered out; it is expected that a message has already been logged
@@ -217,6 +219,9 @@ export default class CandidateGenerator extends Module {
     return await this.generateWriteCandidates(dat, game, foundRomsWithArchiveFiles);
   }
 
+  /**
+   * Filter to only the input files that can be used for a {@link Game}'s {@link ROM}s.
+   */
   private filterLegalInputFilesForGame(
     dat: DAT,
     game: Game,
@@ -233,14 +238,12 @@ export default class CandidateGenerator extends Module {
         return [rom, inputFiles];
       }
 
-      const isAreRawWriting =
-        this.options.shouldWrite() &&
-        !this.options.shouldExtractRom(rom) &&
-        !this.options.shouldZipRom(rom);
+      const areRewritingRom = this.options.shouldExtractRom(rom) || this.options.shouldZipRom(rom);
+      const areRawWriting = this.options.shouldWrite() && !areRewritingRom;
 
       const filteredInputFiles = inputFiles.filter((inputFile) => {
         if (
-          !isAreRawWriting &&
+          !areRawWriting &&
           inputFile instanceof ArchiveEntry &&
           !(rom instanceof Disk) &&
           !inputFile.canExtract()
@@ -253,17 +256,19 @@ export default class CandidateGenerator extends Module {
         }
 
         if (
-          isAreRawWriting &&
+          // We aren't extracting or zipping, so archive entries are used as-is and must be named
+          // correctly
+          !areRewritingRom &&
           inputFile instanceof ArchiveEntry &&
           rom.getName().trim() !== '' &&
           inputFile.getArchive().hasMeaningfulEntryPaths()
         ) {
-          const outputPath = OutputFactory.getPath(this.options, dat, game, rom, inputFile);
-          if (outputPath.entryPath !== inputFile.getExtractedFilePath()) {
+          const expectedEntryPath = OutputFactory.getEntryPath(this.options, game, rom, inputFile);
+          if (expectedEntryPath !== inputFile.getExtractedFilePath()) {
             // The input file is an ArchiveEntry that we won't rewrite and its name doesn't match
             // what we want it to be
             this.prefixedLogger.trace(
-              `${dat.getName()}: ${game.getName()}: ${rom.getName()}: can't use archive because the entry '${inputFile.getExtractedFilePath()}' doesn't have the correct path '${outputPath.entryPath}'`,
+              `${dat.getName()}: ${game.getName()}: ${rom.getName()}: can't use archive because the entry '${inputFile.getExtractedFilePath()}' doesn't have the correct path '${expectedEntryPath}'`,
             );
             return false;
           }
@@ -298,24 +303,33 @@ export default class CandidateGenerator extends Module {
       );
     }
 
+    // Disks are always their own file (e.g. a .chd), they're never stored inside a Game's archive,
+    // so requiring an archive to contain them would mean no archive ever contains "every ROM"
     const archiveWithEveryRom = this.findArchiveFileWithEveryRomForGame(
       dat,
       game,
-      gameRoms,
-      romsAndInputFiles,
+      gameRoms.filter((rom) => !(rom instanceof Disk)),
+      romsAndInputFiles.filter(([rom]) => !(rom instanceof Disk)),
       indexedFiles,
     );
     if (archiveWithEveryRom !== undefined) {
-      return archiveWithEveryRom;
+      return new Map([
+        ...archiveWithEveryRom,
+        // Resolve the disks that were held back above on their own, trusting that ROMIndexer
+        // applied any preferences we wanted
+        ...romsAndInputFiles
+          .filter(([rom]) => rom instanceof Disk)
+          .flatMap(([rom, [firstInputFile]]): [ROM, File][] =>
+            firstInputFile === undefined ? [] : [[rom, firstInputFile]],
+          ),
+      ]);
     }
 
     return new Map(
-      romsAndInputFiles
-        .filter(([, inputFiles]) => inputFiles.length > 0)
-        .map(([rom, inputFiles]) => {
-          // Trust that ROMIndexer applied any preferences we wanted
-          return [rom, inputFiles[0]];
-        }),
+      // Trust that ROMIndexer applied any preferences we wanted
+      romsAndInputFiles.flatMap(([rom, [firstInputFile]]): [ROM, File][] =>
+        firstInputFile === undefined ? [] : [[rom, firstInputFile]],
+      ),
     );
   }
 
@@ -333,10 +347,10 @@ export default class CandidateGenerator extends Module {
     // instance, so it survives any earlier reinstantiation
     const entryKey = (rom: ROM): string => `${rom.getName()}|${rom.hashCode()}`;
     const entriesByKey = new Map<string, [ROM, File[]]>(
-      romsAndInputFiles.map((romAndInputFiles) => [
-        entryKey(romAndInputFiles[0]),
-        romAndInputFiles,
-      ]),
+      romsAndInputFiles.map((romAndInputFiles): [string, [ROM, File[]]] => {
+        const [rom] = romAndInputFiles;
+        return [entryKey(rom), romAndInputFiles];
+      }),
     );
 
     // Resolve each sub-game's single containing archive, keyed by entryKey
@@ -376,12 +390,15 @@ export default class CandidateGenerator extends Module {
   }
 
   /**
-   * Find a single input {@link Archive} that contains every one of a {@link Game}'s {@link ROM}s, and
-   * return a map from each ROM to its matching entry within that archive. Preferring one archive for
-   * the whole game avoids output-path conflicts when raw-copying and avoids leaving archives partially
-   * used when zipping. Returns `undefined` when extracting (the source archive doesn't matter) or when
-   * no single archive holds every ROM, leaving the caller to fall back to per-ROM matching. ROMs with
-   * no matching entry are omitted from the returned map, so it is always a `Map<ROM, File>` of only
+   * Find a single input {@link Archive} that contains every one of the given {@link ROM}s (the
+   * caller is expected to have excluded {@link Disk}s, which always live outside of a
+   * {@link Game}'s archive), and return a map from each ROM to its matching entry within that
+   * archive. Preferring one archive for the whole game avoids output-path conflicts when
+   * raw-copying and avoids leaving archives partially used when zipping. Returns `undefined` when
+   * extracting (the source archive doesn't matter), when plain files are preferred and every ROM
+   * has one and we aren't zipping (the preference would otherwise be ignored), or when no single
+   * archive holds every ROM, leaving the caller to fall back to per-ROM matching. ROMs with no
+   * matching entry are omitted from the returned map, so it is always a `Map<ROM, File>` of only
    * resolved ROMs.
    */
   private findArchiveFileWithEveryRomForGame(
@@ -399,6 +416,29 @@ export default class CandidateGenerator extends Module {
       // We're extracting files, we don't particularly care where they come from, respect any
       // previous sorting
       return undefined;
+    }
+
+    const preferFiletype = this.options.getPreferFiletype();
+    if (
+      (preferFiletype === undefined || preferFiletype === PreferFiletype.PLAIN) &&
+      gameRoms.some((rom) => !this.options.shouldZipRom(rom))
+    ) {
+      // We're preferring non-archived files, and at least one ROM isn't being zipped. If we can
+      // find a non-archived match for every ROM then we shouldn't look for an archive that contains
+      // everything desired.
+      const romHashCodesWithPlainFile = new Set(
+        romsAndInputFiles
+          .filter(([, inputFiles]) =>
+            inputFiles.some((inputFile) => !(inputFile instanceof ArchiveEntry)),
+          )
+          .map(([rom]) => rom.hashCode()),
+      );
+      if (gameRoms.every((rom) => romHashCodesWithPlainFile.has(rom.hashCode()))) {
+        this.prefixedLogger.trace(
+          `${dat.getName()}: ${game.getName()}: not preferring an archive that contains every ROM, every ROM has a preferred plain input file`,
+        );
+        return undefined;
+      }
     }
 
     // Detect if there is one input archive that contains every ROM, and prefer to use its entries.
@@ -697,6 +737,7 @@ export default class CandidateGenerator extends Module {
     dat: DAT,
     game: Game,
     romsWithFiles: ROMWithFiles[],
+    indexedFiles: IndexedFiles,
   ): Promise<string | undefined> {
     // TODO(cemmer): this is an issue when raw-writing at the same time, it causes extraction
     if (this.options.shouldDir2Dat()) {
@@ -709,8 +750,17 @@ export default class CandidateGenerator extends Module {
       return 'zipping all ROMs from a DAT together later';
     }
 
+    // Disks are always their own file (e.g. a .chd), they're never stored inside a Game's archive,
+    // so they can't have a say in whether that archive can be raw-copied
+    const nonDiskRomsWithFiles = romsWithFiles.filter(
+      (romWithFiles) => !(romWithFiles.getRom() instanceof Disk),
+    );
+    if (nonDiskRomsWithFiles.length === 0) {
+      return "game doesn't have any ROMs that could come from an archive";
+    }
+
     // Checks for all archive types, zips and otherwise
-    for (const romWithFiles of romsWithFiles) {
+    for (const romWithFiles of nonDiskRomsWithFiles) {
       const rom = romWithFiles.getRom();
       const inputFile = romWithFiles.getInputFile();
 
@@ -763,6 +813,7 @@ export default class CandidateGenerator extends Module {
         return "input archive is being zipped and it isn't already a zip";
       }
 
+      // eslint-disable-next-line unicorn/prefer-continue
       if (rom.getName().trim() !== '' && inputFile.getArchive().hasMeaningfulEntryPaths()) {
         const outputPath = OutputFactory.getPath(this.options, dat, game, rom, inputFile);
         if (outputPath.entryPath !== inputFile.getExtractedFilePath()) {
@@ -772,9 +823,14 @@ export default class CandidateGenerator extends Module {
       }
     }
 
+    if (this.hasExcessFiles(dat, game, nonDiskRomsWithFiles, indexedFiles)) {
+      // The existing archive can't have excess files, or they have to be explicitly allowed
+      return 'input archive has excess entries';
+    }
+
     if (
-      romsWithFiles.length > 1 &&
-      romsWithFiles
+      nonDiskRomsWithFiles.length > 1 &&
+      nonDiskRomsWithFiles
         .map((romWithFiles) => romWithFiles.getOutputFile().getFilePath())
         .reduce(ArrayUtil.reduceUnique(), []).length > 1 &&
       game instanceof MergedDiscGame
@@ -785,19 +841,27 @@ export default class CandidateGenerator extends Module {
     }
 
     if (
-      romsWithFiles.filter(
+      nonDiskRomsWithFiles.filter(
         ArrayUtil.filterUniqueMapped((romWithFiles) => romWithFiles.getInputFile().getFilePath()),
       ).length !== 1
     ) {
       // Every input file has to be coming from the same archive
       return 'input files are coming from different archives';
     }
-    const inputArchive = (romsWithFiles[0].getInputFile() as ArchiveEntry<Archive>).getArchive();
+    const [firstNonDiskRomWithFiles] = nonDiskRomsWithFiles;
+    if (firstNonDiskRomWithFiles === undefined) {
+      return undefined;
+    }
+    const firstInputFile = firstNonDiskRomWithFiles.getInputFile();
+    if (!(firstInputFile instanceof ArchiveEntry)) {
+      return `input file isn't from an archive`;
+    }
+    const inputArchive = firstInputFile.getArchive();
 
     // If we're allowed to re-zip archives, check if the zip file is a valid structured archive or not
     if (
       inputArchive instanceof Zip &&
-      romsWithFiles.every((romWithFiles) => this.options.shouldZipRom(romWithFiles.getRom()))
+      nonDiskRomsWithFiles.every((romWithFiles) => this.options.shouldZipRom(romWithFiles.getRom()))
     ) {
       const tzValidationResult = await this.fileFactory.tzValidationFrom(inputArchive);
       if (tzValidationResult === ValidationResult.INVALID) {
@@ -828,6 +892,7 @@ export default class CandidateGenerator extends Module {
     dat: DAT,
     game: Game,
     foundRomsWithFiles: ROMWithFiles[],
+    indexedFiles: IndexedFiles,
   ): Promise<ROMWithFiles[]> {
     if (foundRomsWithFiles.length === 0) {
       // There aren't any ROMs
@@ -840,6 +905,7 @@ export default class CandidateGenerator extends Module {
       dat,
       game,
       foundRomsWithFiles,
+      indexedFiles,
     );
     return (
       await Promise.all(
@@ -915,21 +981,22 @@ export default class CandidateGenerator extends Module {
 
     // Warn if the only reason we're missing files is that we don't know if we can rewrite .cue
     // files extracted from CHDs with the right contents such that it matches a DAT perfectly
-    if (missingRoms.every((rom) => rom.getName().toLowerCase().endsWith('.cue'))) {
-      const chdInputFile = foundRomsWithFiles
-        .map((romWithFiles) => romWithFiles.getInputFile())
-        .find(
-          (inputFile): inputFile is ArchiveEntry<ChdBinCue> =>
-            inputFile instanceof ArchiveEntry && inputFile.getArchive() instanceof ChdBinCue,
-        );
-      const missingCueRom = missingRoms.find(
-        (rom) => this.options.shouldExtractRom(rom) || this.options.shouldZipRom(rom),
+    if (missingRoms.some((rom) => !rom.getName().toLowerCase().endsWith('.cue'))) {
+      return;
+    }
+    const chdInputFile = foundRomsWithFiles
+      .map((romWithFiles) => romWithFiles.getInputFile())
+      .find(
+        (inputFile): inputFile is ArchiveEntry<ChdBinCue> =>
+          inputFile instanceof ArchiveEntry && inputFile.getArchive() instanceof ChdBinCue,
       );
-      if (chdInputFile !== undefined && missingCueRom !== undefined) {
-        this.prefixedLogger.trace(
-          `${dat.getName()}: ${game.getName()}: cannot extract .cue sheets from CHDs because Igir doesn't know how to rewrite the track filenames accurately: ${chdInputFile.getArchive().getFilePath()}`,
-        );
-      }
+    const missingCueRom = missingRoms.find(
+      (rom) => this.options.shouldExtractRom(rom) || this.options.shouldZipRom(rom),
+    );
+    if (chdInputFile !== undefined && missingCueRom !== undefined) {
+      this.prefixedLogger.trace(
+        `${dat.getName()}: ${game.getName()}: cannot extract .cue sheets from CHDs because Igir doesn't know how to rewrite the track filenames accurately: ${chdInputFile.getArchive().getFilePath()}`,
+      );
     }
   }
 
@@ -963,21 +1030,29 @@ export default class CandidateGenerator extends Module {
 
     let hasConflict = false;
     for (const duplicateOutput of duplicateOutputPaths) {
-      // For an output path that has multiple input paths, filter to only the unique input paths,
-      //  and if there are still multiple input file paths then we won't be able to resolve this
-      //  at write time
-      const conflictedInputFiles = romsWithFiles
-        .filter((romWithFiles) => romWithFiles.getOutputFile().getFilePath() === duplicateOutput)
+      // For an output path that has multiple input files, if they wouldn't all write the same
+      //  contents then we won't be able to resolve this at write time
+      const [firstRomWithFiles, ...otherRomsWithFiles] = romsWithFiles.filter(
+        (romWithFiles) => romWithFiles.getOutputFile().getFilePath() === duplicateOutput,
+      );
+      if (firstRomWithFiles === undefined) {
+        continue;
+      }
+      const conflictedRomsWithFiles = otherRomsWithFiles.filter(
+        (romWithFiles) => !romWithFiles.writesSameOutputAs(firstRomWithFiles),
+      );
+      if (conflictedRomsWithFiles.length === 0) {
+        continue;
+      }
+      const conflictedInputFiles = [firstRomWithFiles, ...conflictedRomsWithFiles]
         .map((romWithFiles) => romWithFiles.getInputFile().toString())
         .reduce(ArrayUtil.reduceUnique(), []);
-      if (conflictedInputFiles.length > 1) {
-        hasConflict = true;
-        let message = `${dat.getName()}: no single archive contains all necessary files, cannot ${this.options.writeString()} these different input files to: ${duplicateOutput}:`;
-        for (const conflictedInputFile of conflictedInputFiles) {
-          message += `\n  ${conflictedInputFile}`;
-        }
-        this.prefixedLogger.warn(message);
+      hasConflict = true;
+      let message = `${dat.getName()}: no single archive contains all necessary files, cannot ${this.options.writeString()} these different input files to: ${duplicateOutput}:`;
+      for (const conflictedInputFile of conflictedInputFiles) {
+        message += `\n  ${conflictedInputFile}`;
       }
+      this.prefixedLogger.warn(message);
     }
     return hasConflict;
   }
@@ -1046,12 +1121,13 @@ export default class CandidateGenerator extends Module {
       .map((romWithFiles) => {
         const rom = romWithFiles.getRom();
         const inputFile = romWithFiles.getInputFile();
+        if (!(inputFile instanceof ArchiveEntry || inputFile instanceof ArchiveFile)) {
+          return undefined;
+        }
         const candidates = indexedFiles
-          .findFiles(rom)
+          .findFilesAtPath(rom, inputFile.getFilePath())
           .filter(
             (foundFile) =>
-              foundFile.getFilePath() === inputFile.getFilePath() &&
-              (inputFile instanceof ArchiveEntry || inputFile instanceof ArchiveFile) &&
               foundFile instanceof ArchiveEntry &&
               inputFile.getArchive() === foundFile.getArchive(),
           );
@@ -1075,7 +1151,7 @@ export default class CandidateGenerator extends Module {
 
     if (
       inputArchives.length === 1 &&
-      inputArchives[0] instanceof ChdBinCue &&
+      inputArchives.at(0) instanceof ChdBinCue &&
       CandidateGenerator.onlyCueFilesMissingFromChd(
         game,
         romsWithFiles.map((romWithFiles) => romWithFiles.getRom()),
@@ -1187,8 +1263,8 @@ export default class CandidateGenerator extends Module {
       outputFileSize = inputFile.getSizeWithoutHeader();
     }
 
-    if (inputFile.getPaddings().length === 1) {
-      const desiredPadding = inputFile.getPaddings()[0];
+    const [desiredPadding, ...otherPaddings] = inputFile.getPaddings();
+    if (desiredPadding !== undefined && otherPaddings.length === 0) {
       outputFileCrc32 = desiredPadding.getCrc32();
       outputFileMd5 = desiredPadding.getMd5();
       outputFileSha1 = desiredPadding.getSha1();

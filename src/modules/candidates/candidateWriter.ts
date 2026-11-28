@@ -18,6 +18,7 @@ import ZeroSizeFile from '../../models/files/zeroSizeFile.js';
 import type Options from '../../models/options.js';
 import type { ZipFormatValue } from '../../models/options.js';
 import { LinkMode, ZipFormat } from '../../models/options.js';
+import type ROMWithFiles from '../../models/romWithFiles.js';
 import type WriteCandidate from '../../models/writeCandidate.js';
 import ArrayUtil from '../../utils/arrayUtil.js';
 import type { MoveResultValue } from '../../utils/fsUtil.js';
@@ -35,7 +36,7 @@ export interface CandidateWriterResults {
  */
 export default class CandidateWriter extends Module {
   // Keep track of written files, to warn on conflicts
-  private static readonly OUTPUT_PATHS_WRITTEN = new Map<string, DAT>();
+  private static readonly OUTPUT_PATHS_WRITTEN = new Map<string, string>();
 
   private readonly options: Options;
   private readonly fileFactory: FileFactory;
@@ -77,17 +78,26 @@ export default class CandidateWriter extends Module {
       };
     }
 
-    const inputToOutputFiles = new Set<string>();
+    const outputLocationsToRomsWithFiles = new Map<string, ROMWithFiles[]>();
     const writableCandidates = candidates
       .filter((candidate) => candidate.canWrite())
-      // Deduplicate input->output files
+      // Deduplicate files that would write the same output
       .map((candidate) => {
         const nonDuplicateRomsWithFiles = candidate.getRomsWithFiles().filter((romWithFiles) => {
-          const inputToOutputFile = `${romWithFiles.getInputFile().toString()} → ${romWithFiles.getOutputFile().toString()}`;
-          if (inputToOutputFiles.has(inputToOutputFile)) {
+          const outputLocation = romWithFiles.getOutputFile().getLocationKey();
+          const previousRomsWithFiles = outputLocationsToRomsWithFiles.get(outputLocation);
+          if (previousRomsWithFiles === undefined) {
+            outputLocationsToRomsWithFiles.set(outputLocation, [romWithFiles]);
+            return true;
+          }
+          if (
+            previousRomsWithFiles.some((previousRomWithFiles) =>
+              previousRomWithFiles.writesSameOutputAs(romWithFiles),
+            )
+          ) {
             return false;
           }
-          inputToOutputFiles.add(inputToOutputFile);
+          previousRomsWithFiles.push(romWithFiles);
           return true;
         });
         if (nonDuplicateRomsWithFiles.length === candidate.getRomsWithFiles().length) {
@@ -108,7 +118,7 @@ export default class CandidateWriter extends Module {
     }
     this.progressBar.resetProgress(writableCandidates.length);
 
-    await this.candidateSemaphore.map(writableCandidates, async (candidate) => {
+    await this.candidateSemaphore.mapCandidates(writableCandidates, async (candidate) => {
       this.progressBar.incrementInProgress();
       this.prefixedLogger.trace(
         `${dat.getName()}: ${candidate.getName()}: ${this.options.shouldWrite() ? 'writing' : 'testing'} candidate`,
@@ -170,22 +180,30 @@ export default class CandidateWriter extends Module {
     // Return no files if there are none to write
     const inputToOutputZipEntries = candidate
       .getRomsWithFiles()
-      .filter((romWithFiles) => romWithFiles.getOutputFile() instanceof ArchiveEntry)
-      .map((romWithFiles) => [
+      .map((romWithFiles): [File, File] => [
         romWithFiles.getInputFile(),
-        romWithFiles.getOutputFile() as ArchiveEntry<Zip>,
-      ]) satisfies [File, ArchiveEntry<Zip>][];
-    if (inputToOutputZipEntries.length === 0) {
+        romWithFiles.getOutputFile(),
+      ])
+      .filter((inputToOutput): inputToOutput is [File, ArchiveEntry<Zip>] => {
+        const [, outputFile] = inputToOutput;
+        return outputFile instanceof ArchiveEntry && outputFile.getArchive() instanceof Zip;
+      });
+    const [firstInputToOutputZipEntry] = inputToOutputZipEntries;
+    if (firstInputToOutputZipEntry === undefined) {
       return;
     }
 
     // Prep the single output file
-    const outputZip = inputToOutputZipEntries[0][1].getArchive() as Zip;
+    const [, firstOutputZipEntry] = firstInputToOutputZipEntry;
+    const outputZip = firstOutputZipEntry.getArchive();
+    if (!(outputZip instanceof Zip)) {
+      return;
+    }
 
     const childBar = this.progressBar.addChildBar({
       name: outputZip.getFilePath(),
       total: inputToOutputZipEntries.reduce(
-        (sum, [, outputEntry]) => sum + outputEntry.getSize(),
+        (sum, [, outputEntry]) => sum + (outputEntry.getSize() ?? 0),
         0,
       ),
       progressFormatter: FsUtil.sizeReadable.bind(FsUtil),
@@ -200,7 +218,7 @@ export default class CandidateWriter extends Module {
         ) {
           if (CandidateWriter.OUTPUT_PATHS_WRITTEN.has(outputZip.getFilePath())) {
             this.prefixedLogger.warn(
-              `${dat.getName()}: ${candidate.getName()}: ${outputZip.getFilePath()}: not overwriting existing zip file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(outputZip.getFilePath())?.getName()}'`,
+              `${dat.getName()}: ${candidate.getName()}: ${outputZip.getFilePath()}: not overwriting existing zip file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(outputZip.getFilePath())}'`,
             );
           } else {
             this.prefixedLogger.debug(
@@ -241,7 +259,7 @@ export default class CandidateWriter extends Module {
           CandidateWriter.OUTPUT_PATHS_WRITTEN.has(outputZip.getFilePath())
         ) {
           this.prefixedLogger.warn(
-            `${dat.getName()}: ${candidate.getName()}: ${outputZip.getFilePath()}: overwriting existing zip file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(outputZip.getFilePath())?.getName()}'`,
+            `${dat.getName()}: ${candidate.getName()}: ${outputZip.getFilePath()}: overwriting existing zip file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(outputZip.getFilePath())}'`,
           );
         }
       }
@@ -249,7 +267,7 @@ export default class CandidateWriter extends Module {
         return;
       }
 
-      CandidateWriter.OUTPUT_PATHS_WRITTEN.set(outputZip.getFilePath(), dat);
+      CandidateWriter.OUTPUT_PATHS_WRITTEN.set(outputZip.getFilePath(), dat.getName());
 
       this.progressBar.setSymbol(ProgressBarSymbol.WRITING);
       let wasWritten = false;
@@ -266,25 +284,26 @@ export default class CandidateWriter extends Module {
           // Successfully written, unknown if valid
           break;
         }
-        if (wasWritten && this.options.shouldTest()) {
-          const writtenTest = await this.testZipContents(
-            dat,
-            candidate,
-            outputZip.getFilePath(),
-            inputToOutputZipEntries.map((entry) => entry[1]),
-            childBar,
-          );
-          if (!writtenTest) {
-            // Successfully validated
-            break;
-          }
-          const message = `${dat.getName()}: ${candidate.getName()}: ${outputZip.getFilePath()}: written zip ${writtenTest}`;
-          if (i < this.options.getWriteRetry()) {
-            this.prefixedLogger.warn(`${message}, retrying`);
-          } else {
-            this.prefixedLogger.error(message);
-            return; // final error, do not continue
-          }
+        if (!wasWritten || !this.options.shouldTest()) {
+          continue;
+        }
+        const writtenTest = await this.testZipContents(
+          dat,
+          candidate,
+          outputZip.getFilePath(),
+          inputToOutputZipEntries.map(([, outputZipEntry]) => outputZipEntry),
+          childBar,
+        );
+        if (!writtenTest) {
+          // Successfully validated
+          break;
+        }
+        const message = `${dat.getName()}: ${candidate.getName()}: ${outputZip.getFilePath()}: written zip ${writtenTest}`;
+        if (i < this.options.getWriteRetry()) {
+          this.prefixedLogger.warn(`${message}, retrying`);
+        } else {
+          this.prefixedLogger.error(message);
+          return; // final error, do not continue
         }
       }
 
@@ -311,11 +330,42 @@ export default class CandidateWriter extends Module {
 
     const zipFile = new Zip(zipFilePath);
 
-    const expectedEntriesByPath = expectedArchiveEntries.reduce((map, entry) => {
-      map.set(entry.getEntryPath(), entry);
-      return map;
-    }, new Map<string, ArchiveEntry<Zip>>());
+    const expectedEntriesByPath = new Map(
+      expectedArchiveEntries.map((entry) => [entry.getEntryPath(), entry]),
+    );
 
+    // Check every entry's existence and size first, these come from the zip's central directory
+    // without reading any entry's bytes, before the expense of calculating checksums
+    let listedEntries: ArchiveEntry<Zip>[];
+    try {
+      listedEntries =
+        (await this.fileFactory.entriesFromArchive(
+          zipFile,
+          ChecksumBitmask.NONE,
+          CacheMode.IGNORE_CACHED_VALUE,
+        )) ?? [];
+    } catch (error) {
+      return `failed to get archive contents: ${error}`;
+    }
+    const listedEntriesByPath = new Map(
+      listedEntries.map((entry) => [entry.getEntryPath(), entry]),
+    );
+    if (listedEntriesByPath.size !== expectedEntriesByPath.size) {
+      return `has ${IntlUtil.toLocaleString(listedEntriesByPath.size)} files, expected ${IntlUtil.toLocaleString(expectedEntriesByPath.size)}`;
+    }
+    for (const [entryPath, expectedFile] of expectedEntriesByPath) {
+      const listedFile = listedEntriesByPath.get(entryPath);
+      if (listedFile === undefined) {
+        return `is missing the file ${entryPath}`;
+      }
+      const listedSize = listedFile.getSize();
+      const expectedSize = expectedFile.getSize();
+      if (expectedSize !== undefined && listedSize !== expectedSize) {
+        return `entry '${entryPath}' has the file ${entryPath} of size ${listedSize === undefined ? 'unknown' : `${IntlUtil.toLocaleString(listedSize)}B`}, expected ${IntlUtil.toLocaleString(expectedSize)}B`;
+      }
+    }
+
+    // Check every entry's checksums
     const checksumBitmask = expectedArchiveEntries.reduce<number>(
       (bitmask, entry) => bitmask | entry.getChecksumBitmask(),
       ChecksumBitmask.CRC32,
@@ -340,22 +390,14 @@ export default class CandidateWriter extends Module {
       return `failed to get archive contents: ${error}`;
     }
 
-    const actualEntriesByPath = archiveEntries.reduce((map, entry) => {
-      map.set(entry.getEntryPath(), entry);
-      return map;
-    }, new Map<string, ArchiveEntry<Zip>>());
-    if (actualEntriesByPath.size !== expectedEntriesByPath.size) {
-      return `has ${IntlUtil.toLocaleString(actualEntriesByPath.size)} files, expected ${IntlUtil.toLocaleString(expectedEntriesByPath.size)}`;
-    }
-
+    const actualEntriesByPath = new Map(
+      archiveEntries.map((entry) => [entry.getEntryPath(), entry]),
+    );
     for (const [entryPath, expectedFile] of expectedEntriesByPath) {
-      // Check existence
-      if (!actualEntriesByPath.has(entryPath)) {
+      const actualFile = actualEntriesByPath.get(entryPath);
+      if (actualFile === undefined) {
         return `is missing the file ${entryPath}`;
       }
-
-      // Check checksum
-      const actualFile = actualEntriesByPath.get(entryPath) as ArchiveEntry<Zip>;
       if (
         actualFile.getSha256() &&
         expectedFile.getSha256() &&
@@ -383,15 +425,6 @@ export default class CandidateWriter extends Module {
         actualFile.getCrc32() !== expectedFile.getCrc32()
       ) {
         return `entry '${entryPath}' has the CRC32 ${actualFile.getCrc32()}, expected ${expectedFile.getCrc32()}`;
-      }
-
-      // Check size
-      if (
-        actualFile.getCrc32() &&
-        expectedFile.getCrc32() &&
-        actualFile.getSize() !== expectedFile.getSize()
-      ) {
-        return `entry '${entryPath}' has the file ${entryPath} of size ${IntlUtil.toLocaleString(actualFile.getSize())}B, expected ${IntlUtil.toLocaleString(expectedFile.getSize())}B`;
       }
     }
 
@@ -447,10 +480,13 @@ export default class CandidateWriter extends Module {
         [
           `${dat.getName()}: ${candidate.getName()}: creating zip archive '${outputZip.getFilePath()}' with the entr${movedInputToOutputZipEntries.length === 1 ? 'y' : 'ies'}:`,
           ...movedInputToOutputZipEntries.map(([input, output]) => {
+            const inputSize = input.getSize();
+            const inputSizeReadable =
+              inputSize === undefined ? 'unknown size' : FsUtil.sizeReadable(inputSize);
             if (input.getFilePath() === output.getFilePath()) {
-              return `  '${input.getExtractedFilePath()}' (${FsUtil.sizeReadable(input.getSize())}) → '${output.getExtractedFilePath()}' ${input.getExtractedFilePath() === output.getExtractedFilePath() ? '(rewriting)' : ''}`;
+              return `  '${input.getExtractedFilePath()}' (${inputSizeReadable}) → '${output.getExtractedFilePath()}' ${input.getExtractedFilePath() === output.getExtractedFilePath() ? '(rewriting)' : ''}`;
             }
-            return `  '${input.toString()}' (${FsUtil.sizeReadable(input.getSize())}) → '${output.getExtractedFilePath()}'`;
+            return `  '${input.toString()}' (${inputSizeReadable}) → '${output.getExtractedFilePath()}'`;
           }),
         ].join('\n'),
       );
@@ -495,33 +531,28 @@ export default class CandidateWriter extends Module {
     const inputToOutputEntries = candidate
       .getRomsWithFiles()
       .filter((romWithFiles) => !(romWithFiles.getOutputFile() instanceof ArchiveEntry))
-      .map((romWithFiles) => [romWithFiles.getInputFile(), romWithFiles.getOutputFile()]);
+      .map((romWithFiles): [File, File] => [
+        romWithFiles.getInputFile(),
+        romWithFiles.getOutputFile(),
+      ]);
 
     // Return no files if there are none to write
     if (inputToOutputEntries.length === 0) {
       return;
     }
 
-    const totalBytes = inputToOutputEntries
-      .flatMap(([, outputFile]) => outputFile)
-      .reduce((sum, file) => sum + file.getSize(), 0);
+    const totalBytes = inputToOutputEntries.reduce(
+      (sum, [, outputFile]) => sum + (outputFile.getSize() ?? 0),
+      0,
+    );
     this.prefixedLogger.trace(
       `${dat.getName()}: ${candidate.getName()}: ${this.options.shouldMove() ? 'moving' : 'copying'} ${FsUtil.sizeReadable(totalBytes)} of ${IntlUtil.toLocaleString(inputToOutputEntries.length)} ${inputToOutputEntries.some(([input]) => input instanceof ArchiveFile) ? 'archive' : 'raw'} file${inputToOutputEntries.length === 1 ? '' : 's'}`,
     );
 
     // Group the input->output pairs by the input file's path. The goal is to extract entries from
     // the same input archive at the same time, to benefit from batch extraction.
-    const uniqueInputToOutputEntriesMap = inputToOutputEntries.reduce(
-      (map, [inputRomFile, outputRomFile]) => {
-        const key = inputRomFile.getFilePath();
-        if (map.has(key)) {
-          map.get(key)?.push([inputRomFile, outputRomFile]);
-        } else {
-          map.set(key, [[inputRomFile, outputRomFile]]);
-        }
-        return map;
-      },
-      new Map<string, [File, File][]>(),
+    const uniqueInputToOutputEntriesMap = Map.groupBy(inputToOutputEntries, ([inputRomFile]) =>
+      inputRomFile.getFilePath(),
     );
     for (const groupedInputToOutput of uniqueInputToOutputEntriesMap.values()) {
       await Promise.all(
@@ -563,7 +594,7 @@ export default class CandidateWriter extends Module {
     const childBar = this.progressBar.addChildBar({
       name: outputFilePath,
       // Files being patched might not have a known final size, just guess it as the input size
-      total: outputRomFile.getSize() > 0 ? outputRomFile.getSize() : inputRomFile.getSize(),
+      total: outputRomFile.getSize() ?? inputRomFile.getSize(),
       progressFormatter: FsUtil.sizeReadable.bind(FsUtil),
     });
     try {
@@ -576,7 +607,7 @@ export default class CandidateWriter extends Module {
         ) {
           if (CandidateWriter.OUTPUT_PATHS_WRITTEN.has(outputFilePath)) {
             this.prefixedLogger.warn(
-              `${dat.getName()}: ${candidate.getName()}: ${outputFilePath}: not overwriting existing file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(outputFilePath)?.getName()}'`,
+              `${dat.getName()}: ${candidate.getName()}: ${outputFilePath}: not overwriting existing file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(outputFilePath)}'`,
             );
           } else {
             this.prefixedLogger.debug(
@@ -615,7 +646,7 @@ export default class CandidateWriter extends Module {
           CandidateWriter.OUTPUT_PATHS_WRITTEN.has(outputFilePath)
         ) {
           this.prefixedLogger.warn(
-            `${dat.getName()}: ${candidate.getName()}: ${outputFilePath}: overwriting existing file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(outputFilePath)?.getName()}'`,
+            `${dat.getName()}: ${candidate.getName()}: ${outputFilePath}: overwriting existing file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(outputFilePath)}'`,
           );
         }
       }
@@ -623,7 +654,7 @@ export default class CandidateWriter extends Module {
         return;
       }
 
-      CandidateWriter.OUTPUT_PATHS_WRITTEN.set(outputFilePath, dat);
+      CandidateWriter.OUTPUT_PATHS_WRITTEN.set(outputFilePath, dat.getName());
 
       this.progressBar.setSymbol(ProgressBarSymbol.WRITING);
       let written: MoveResultValue | undefined;
@@ -721,8 +752,11 @@ export default class CandidateWriter extends Module {
         return [copyResult, undefined];
       }
 
+      const inputSize = inputRomFile.getSize();
+      const inputSizeReadable =
+        inputSize === undefined ? 'unknown size' : FsUtil.sizeReadable(inputSize);
       this.prefixedLogger.info(
-        `${dat.getName()}: ${candidate.getName()}: moving file '${inputRomFile.toString()}' (${FsUtil.sizeReadable(inputRomFile.getSize())}) → '${outputFilePath}'`,
+        `${dat.getName()}: ${candidate.getName()}: moving file '${inputRomFile.toString()}' (${inputSizeReadable}) → '${outputFilePath}'`,
       );
 
       try {
@@ -756,8 +790,11 @@ export default class CandidateWriter extends Module {
     outputFilePath: string,
     progressBar: ProgressBar,
   ): Promise<MoveResultValue | undefined> {
+    const inputSize = inputRomFile.getSize();
+    const inputSizeReadable =
+      inputSize === undefined ? 'unknown size' : FsUtil.sizeReadable(inputSize);
     this.prefixedLogger.info(
-      `${dat.getName()}: ${candidate.getName()}: ${inputRomFile instanceof ArchiveEntry ? 'extracting' : 'copying'} file '${inputRomFile.toString()}' (${FsUtil.sizeReadable(inputRomFile.getSize())}) → '${outputFilePath}'`,
+      `${dat.getName()}: ${candidate.getName()}: ${inputRomFile instanceof ArchiveEntry ? 'extracting' : 'copying'} file '${inputRomFile.toString()}' (${inputSizeReadable}) → '${outputFilePath}'`,
     );
 
     try {
@@ -791,6 +828,18 @@ export default class CandidateWriter extends Module {
     this.prefixedLogger.trace(
       `${dat.getName()}: ${candidate.getName()}: ${outputFilePath}: testing raw file`,
     );
+
+    // Check size, before the expense of calculating checksums
+    let actualSize: number;
+    try {
+      actualSize = await FsUtil.size(outputFilePath);
+    } catch (error) {
+      return `failed to get size: ${error}`;
+    }
+    const expectedSize = expectedFile.getSize();
+    if (expectedSize !== undefined && actualSize !== expectedSize) {
+      return `is of size ${IntlUtil.toLocaleString(actualSize)}B, expected ${IntlUtil.toLocaleString(expectedSize)}B`;
+    }
 
     // Check checksum
     let actualFile: File;
@@ -833,11 +882,6 @@ export default class CandidateWriter extends Module {
       actualFile.getCrc32() !== expectedFile.getCrc32()
     ) {
       return `has the CRC32 ${actualFile.getCrc32()}, expected ${expectedFile.getCrc32()}`;
-    }
-
-    // Check size
-    if (actualFile.getCrc32() && actualFile.getSize() !== expectedFile.getSize()) {
-      return `is of size ${IntlUtil.toLocaleString(actualFile.getSize())}B, expected ${IntlUtil.toLocaleString(expectedFile.getSize())}B`;
     }
 
     this.prefixedLogger.trace(
@@ -907,7 +951,7 @@ export default class CandidateWriter extends Module {
       ) {
         if (CandidateWriter.OUTPUT_PATHS_WRITTEN.has(linkPath)) {
           this.prefixedLogger.warn(
-            `${dat.getName()}: ${candidate.getName()}: ${linkPath}: not overwriting existing file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(linkPath)?.getName()}'`,
+            `${dat.getName()}: ${candidate.getName()}: ${linkPath}: not overwriting existing file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(linkPath)}'`,
           );
         } else {
           this.prefixedLogger.debug(
@@ -945,7 +989,7 @@ export default class CandidateWriter extends Module {
 
       if (this.options.shouldWrite() && CandidateWriter.OUTPUT_PATHS_WRITTEN.has(linkPath)) {
         this.prefixedLogger.warn(
-          `${dat.getName()}: ${candidate.getName()}: ${linkPath}: overwriting existing zip file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(linkPath)?.getName()}'`,
+          `${dat.getName()}: ${candidate.getName()}: ${linkPath}: overwriting existing zip file already written by '${CandidateWriter.OUTPUT_PATHS_WRITTEN.get(linkPath)}'`,
         );
       }
     }
@@ -953,7 +997,7 @@ export default class CandidateWriter extends Module {
       return;
     }
 
-    CandidateWriter.OUTPUT_PATHS_WRITTEN.set(linkPath, dat);
+    CandidateWriter.OUTPUT_PATHS_WRITTEN.set(linkPath, dat.getName());
 
     this.progressBar.setSymbol(ProgressBarSymbol.WRITING);
     for (let i = 0; i <= this.options.getWriteRetry(); i += 1) {
@@ -963,29 +1007,30 @@ export default class CandidateWriter extends Module {
         // Successfully written, unknown if valid
         break;
       }
-      if (wasWritten && this.options.shouldTest()) {
-        let writtenTest;
-        if (this.options.getLinkMode() === LinkMode.SYMLINK) {
-          writtenTest = await CandidateWriter.testWrittenSymlink(linkPath, targetPath);
-        } else if (this.options.getLinkMode() === LinkMode.HARDLINK) {
-          writtenTest = await CandidateWriter.testWrittenHardlink(
-            linkPath,
-            inputRomFile.getFilePath(),
-          );
-        } else {
-          writtenTest = await this.testWrittenRaw(dat, candidate, linkPath, outputRomFile);
-        }
-        if (!writtenTest) {
-          // Successfully validated
-          break;
-        }
-        const message = `${dat.getName()}: ${candidate.getName()} ${linkPath}: written link ${writtenTest}`;
-        if (i < this.options.getWriteRetry()) {
-          this.prefixedLogger.warn(`${message}, retrying`);
-        } else {
-          this.prefixedLogger.error(message);
-          return; // final error, do not continue
-        }
+      if (!wasWritten || !this.options.shouldTest()) {
+        continue;
+      }
+      let writtenTest;
+      if (this.options.getLinkMode() === LinkMode.SYMLINK) {
+        writtenTest = await CandidateWriter.testWrittenSymlink(linkPath, targetPath);
+      } else if (this.options.getLinkMode() === LinkMode.HARDLINK) {
+        writtenTest = await CandidateWriter.testWrittenHardlink(
+          linkPath,
+          inputRomFile.getFilePath(),
+        );
+      } else {
+        writtenTest = await this.testWrittenRaw(dat, candidate, linkPath, outputRomFile);
+      }
+      if (!writtenTest) {
+        // Successfully validated
+        break;
+      }
+      const message = `${dat.getName()}: ${candidate.getName()} ${linkPath}: written link ${writtenTest}`;
+      if (i < this.options.getWriteRetry()) {
+        this.prefixedLogger.warn(`${message}, retrying`);
+      } else {
+        this.prefixedLogger.error(message);
+        return; // final error, do not continue
       }
     }
   }

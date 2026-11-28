@@ -1,8 +1,11 @@
+import assert from 'node:assert';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 import MappableSemaphore from '../../../../src/async/mappableSemaphore.js';
 import FileCache from '../../../../src/cache/fileCache.js';
+import IgirException from '../../../../src/exceptions/igirException.js';
 import FileFactory from '../../../../src/factories/fileFactory.js';
 import Temp from '../../../../src/globals/temp.js';
 import ArchiveEntry from '../../../../src/models/files/archives/archiveEntry.js';
@@ -11,13 +14,59 @@ import SevenZip from '../../../../src/models/files/archives/sevenZip/sevenZip.js
 import Zip from '../../../../src/models/files/archives/zip.js';
 import File from '../../../../src/models/files/file.js';
 import { ChecksumBitmask } from '../../../../src/models/files/fileChecksums.js';
-import ROMHeader from '../../../../src/models/files/romHeader.js';
+import FileSignature from '../../../../src/models/files/fileSignature.js';
 import Options from '../../../../src/models/options.js';
 import IPSPatch from '../../../../src/models/patches/ipsPatch.js';
 import ROMScanner from '../../../../src/modules/roms/romScanner.js';
 import bufferUtil from '../../../../src/utils/bufferUtil.js';
 import FsUtil from '../../../../src/utils/fsUtil.js';
+import PathUtil from '../../../../src/utils/pathUtil.js';
 import ProgressBarFake from '../../../console/progressBarFake.js';
+
+describe('constructor', () => {
+  test.each([
+    '..',
+    '../evil.rom',
+    '../../../../tmp/evil.rom',
+    'roms/../../evil.rom',
+    'roms/..',
+    '..\\evil.rom',
+    'roms\\..\\..\\evil.rom',
+    '/etc/passwd',
+    '//server/share/evil.rom',
+    'C:\\Windows\\evil.rom',
+    'c:/windows/evil.rom',
+  ])('should throw on an entry path that escapes the archive: %s', async (entryPath) => {
+    const archive = new Zip('/some/archive.zip');
+    await expect(ArchiveEntry.entryOf({ archive, entryPath })).rejects.toThrow(IgirException);
+  });
+
+  test.each([
+    'Tetris (World).gb',
+    'Nintendo - Game Boy/Tetris (World).gb',
+    './Tetris (World).gb',
+    // Only whole segments count, these are all legal filenames
+    'Final Fantasy VII..disc1.bin',
+    '..hidden.rom',
+    'Game.../rom.bin',
+  ])('should not throw on a legal entry path: %s', async (entryPath) => {
+    const archive = new Zip('/some/archive.zip');
+    await expect(ArchiveEntry.entryOf({ archive, entryPath })).resolves.toBeDefined();
+  });
+
+  it("should leave the size and checksums unknown when they aren't given", async () => {
+    const archive = new Zip(path.join(Temp.getTempDir(), 'nonexistent.zip'));
+    const entry = await ArchiveEntry.entryOf({ archive, entryPath: 'game.rom' });
+    expect(entry.getSize()).toBeUndefined();
+    expect(entry.getSizeWithoutHeader()).toBeUndefined();
+    expect(entry.getCrc32()).toBeUndefined();
+    expect(entry.getCrc32WithoutHeader()).toBeUndefined();
+    expect(entry.getMd5()).toBeUndefined();
+    expect(entry.getSha1()).toBeUndefined();
+    expect(entry.getSha256()).toBeUndefined();
+    expect(entry.getChecksumBitmask()).toEqual(ChecksumBitmask.NONE);
+  });
+});
 
 describe('getEntryPath', () => {
   test.each(['something.rom', 'foo/bar.rom'])(
@@ -28,6 +77,25 @@ describe('getEntryPath', () => {
       expect(archiveEntry.getEntryPath()).toEqual(archiveEntryPath);
     },
   );
+});
+
+describe('getLocationKey', () => {
+  it('should return the archive path and entry path', async () => {
+    const entry = await ArchiveEntry.entryOf({
+      archive: new Zip('file.zip'),
+      entryPath: 'entry.rom',
+    });
+    expect(entry.getLocationKey()).toEqual(`${PathUtil.resolve('file.zip')}|entry.rom`);
+  });
+
+  it('should ignore the symlink source', async () => {
+    const entry = await ArchiveEntry.entryOf({
+      archive: new Zip('file.zip'),
+      entryPath: 'entry.rom',
+      symlinkSource: 'source.zip',
+    });
+    expect(entry.getLocationKey()).toEqual(`${PathUtil.resolve('file.zip')}|entry.rom`);
+  });
 });
 
 describe('getSize', () => {
@@ -56,7 +124,8 @@ describe('getSize', () => {
     it("should get the file's size", async () => {
       const archiveEntries = await new FileFactory(new FileCache()).filesFrom(filePath);
       expect(archiveEntries).toHaveLength(1);
-      const archiveEntry = archiveEntries[0];
+      const archiveEntry = archiveEntries.at(0);
+      assert.ok(archiveEntry !== undefined);
 
       expect(archiveEntry.getSize()).toEqual(expectedSize);
     });
@@ -73,7 +142,8 @@ describe('getSize', () => {
 
         const archiveEntries = await new FileFactory(new FileCache()).filesFrom(tempLink);
         expect(archiveEntries).toHaveLength(1);
-        const archiveEntry = archiveEntries[0];
+        const archiveEntry = archiveEntries.at(0);
+        assert.ok(archiveEntry !== undefined);
 
         expect(archiveEntry.getSize()).toEqual(expectedSize);
       } finally {
@@ -85,11 +155,12 @@ describe('getSize', () => {
       const tempDir = await FsUtil.mkdtemp(Temp.getTempDir());
       try {
         const tempLink = path.join(tempDir, path.basename(filePath));
-        await FsUtil.symlink(path.resolve(filePath), tempLink);
+        await FsUtil.symlink(PathUtil.resolve(filePath), tempLink);
 
         const archiveEntries = await new FileFactory(new FileCache()).filesFrom(tempLink);
         expect(archiveEntries).toHaveLength(1);
-        const archiveEntry = archiveEntries[0];
+        const archiveEntry = archiveEntries.at(0);
+        assert.ok(archiveEntry !== undefined);
 
         expect(archiveEntry.getSize()).toEqual(expectedSize);
       } finally {
@@ -105,7 +176,8 @@ describe('getSize', () => {
 
         const archiveEntries = await new FileFactory(new FileCache()).filesFrom(tempLink);
         expect(archiveEntries).toHaveLength(1);
-        const archiveEntry = archiveEntries[0];
+        const archiveEntry = archiveEntries.at(0);
+        assert.ok(archiveEntry !== undefined);
 
         expect(archiveEntry.getSize()).toEqual(expectedSize);
       } finally {
@@ -144,7 +216,8 @@ describe('getCrc32', () => {
   ])('should hash the full archive entry: %s', async (filePath, expectedCrc) => {
     const archiveEntries = await new FileFactory(new FileCache()).filesFrom(filePath);
     expect(archiveEntries).toHaveLength(1);
-    const archiveEntry = archiveEntries[0];
+    const archiveEntry = archiveEntries.at(0);
+    assert.ok(archiveEntry !== undefined);
 
     expect(archiveEntry.getCrc32()).toEqual(expectedCrc);
     expect(archiveEntry.getCrc32WithoutHeader()).toEqual(expectedCrc);
@@ -188,7 +261,8 @@ describe('getCrc32WithoutHeader', () => {
     async (filePath, expectedCrc) => {
       const archiveEntries = await new FileFactory(new FileCache()).filesFrom(filePath);
       expect(archiveEntries).toHaveLength(1);
-      const archiveEntry = archiveEntries[0];
+      const archiveEntry = archiveEntries.at(0);
+      assert.ok(archiveEntry !== undefined);
 
       expect(archiveEntry.getCrc32()).toEqual(expectedCrc);
       expect(archiveEntry.getCrc32WithoutHeader()).toEqual(expectedCrc);
@@ -210,11 +284,13 @@ describe('getCrc32WithoutHeader', () => {
     async (filePath, expectedCrc) => {
       const archiveEntries = await new FileFactory(new FileCache()).filesFrom(filePath);
       expect(archiveEntries).toHaveLength(1);
-      const header = ROMHeader.headerFromFilename(archiveEntries[0].getExtractedFilePath());
+      const firstArchiveEntry = archiveEntries.at(0);
+      assert.ok(firstArchiveEntry !== undefined);
+      const header = FileSignature.romHeaderFromFilename(firstArchiveEntry.getExtractedFilePath());
       if (header === undefined) {
-        throw new Error(`couldn't get header for: ${archiveEntries[0].getExtractedFilePath()}`);
+        throw new Error(`couldn't get header for: ${firstArchiveEntry.getExtractedFilePath()}`);
       }
-      const archiveEntry = await archiveEntries[0].withFileHeader(header);
+      const archiveEntry = await firstArchiveEntry.withFileHeader(header);
 
       expect(archiveEntry.getCrc32()).not.toEqual(expectedCrc);
       expect(archiveEntry.getCrc32WithoutHeader()).toEqual(expectedCrc);
@@ -263,7 +339,8 @@ describe('getMd5', () => {
       ChecksumBitmask.MD5,
     );
     expect(archiveEntries).toHaveLength(1);
-    const archiveEntry = archiveEntries[0];
+    const archiveEntry = archiveEntries.at(0);
+    assert.ok(archiveEntry !== undefined);
 
     // Some archives store CRC32, or otherwise it won't be defined
     expect(archiveEntry.getMd5()).toEqual(expectedMd5);
@@ -312,7 +389,8 @@ describe('getMd5WithoutHeader', () => {
         ChecksumBitmask.MD5,
       );
       expect(archiveEntries).toHaveLength(1);
-      const archiveEntry = archiveEntries[0];
+      const archiveEntry = archiveEntries.at(0);
+      assert.ok(archiveEntry !== undefined);
 
       // Some archives store CRC32, or otherwise it won't be defined
       expect(archiveEntry.getMd5()).toEqual(expectedMd5);
@@ -339,11 +417,13 @@ describe('getMd5WithoutHeader', () => {
         ChecksumBitmask.MD5,
       );
       expect(archiveEntries).toHaveLength(1);
-      const header = ROMHeader.headerFromFilename(archiveEntries[0].getExtractedFilePath());
+      const firstArchiveEntry = archiveEntries.at(0);
+      assert.ok(firstArchiveEntry !== undefined);
+      const header = FileSignature.romHeaderFromFilename(firstArchiveEntry.getExtractedFilePath());
       if (header === undefined) {
-        throw new Error(`couldn't get header for: ${archiveEntries[0].getExtractedFilePath()}`);
+        throw new Error(`couldn't get header for: ${firstArchiveEntry.getExtractedFilePath()}`);
       }
-      const archiveEntry = await archiveEntries[0].withFileHeader(header);
+      const archiveEntry = await firstArchiveEntry.withFileHeader(header);
 
       expect(archiveEntry.getCrc32()).toBeDefined();
       expect(archiveEntry.getCrc32WithoutHeader()).toBeDefined();
@@ -398,7 +478,8 @@ describe('getSha1', () => {
       ChecksumBitmask.SHA1,
     );
     expect(archiveEntries).toHaveLength(1);
-    const archiveEntry = archiveEntries[0];
+    const archiveEntry = archiveEntries.at(0);
+    assert.ok(archiveEntry !== undefined);
 
     // Some archives store CRC32, or otherwise it won't be defined
     expect(archiveEntry.getMd5()).toBeUndefined();
@@ -453,7 +534,8 @@ describe('getSha1WithoutHeader', () => {
         ChecksumBitmask.SHA1,
       );
       expect(archiveEntries).toHaveLength(1);
-      const archiveEntry = archiveEntries[0];
+      const archiveEntry = archiveEntries.at(0);
+      assert.ok(archiveEntry !== undefined);
 
       // Some archives store CRC32, or otherwise it won't be defined
       expect(archiveEntry.getMd5()).toBeUndefined();
@@ -486,11 +568,13 @@ describe('getSha1WithoutHeader', () => {
         ChecksumBitmask.SHA1,
       );
       expect(archiveEntries).toHaveLength(1);
-      const header = ROMHeader.headerFromFilename(archiveEntries[0].getExtractedFilePath());
+      const firstArchiveEntry = archiveEntries.at(0);
+      assert.ok(firstArchiveEntry !== undefined);
+      const header = FileSignature.romHeaderFromFilename(firstArchiveEntry.getExtractedFilePath());
       if (header === undefined) {
-        throw new Error(`couldn't get header for: ${archiveEntries[0].getExtractedFilePath()}`);
+        throw new Error(`couldn't get header for: ${firstArchiveEntry.getExtractedFilePath()}`);
       }
-      const archiveEntry = await archiveEntries[0].withFileHeader(header);
+      const archiveEntry = await firstArchiveEntry.withFileHeader(header);
 
       expect(archiveEntry.getCrc32()).toBeDefined();
       expect(archiveEntry.getCrc32WithoutHeader()).toBeDefined();
@@ -590,7 +674,8 @@ describe('getSha256', () => {
       ChecksumBitmask.SHA256,
     );
     expect(archiveEntries).toHaveLength(1);
-    const archiveEntry = archiveEntries[0];
+    const archiveEntry = archiveEntries.at(0);
+    assert.ok(archiveEntry !== undefined);
 
     // Some archives store CRC32, or otherwise it won't be defined
     expect(archiveEntry.getMd5()).toBeUndefined();
@@ -690,7 +775,8 @@ describe('getSha256WithoutHeader', () => {
         ChecksumBitmask.SHA256,
       );
       expect(archiveEntries).toHaveLength(1);
-      const archiveEntry = archiveEntries[0];
+      const archiveEntry = archiveEntries.at(0);
+      assert.ok(archiveEntry !== undefined);
 
       // Some archives store CRC32, or otherwise it won't be defined
       expect(archiveEntry.getMd5()).toBeUndefined();
@@ -723,11 +809,13 @@ describe('getSha256WithoutHeader', () => {
         ChecksumBitmask.SHA256,
       );
       expect(archiveEntries).toHaveLength(1);
-      const header = ROMHeader.headerFromFilename(archiveEntries[0].getExtractedFilePath());
+      const firstArchiveEntry = archiveEntries.at(0);
+      assert.ok(firstArchiveEntry !== undefined);
+      const header = FileSignature.romHeaderFromFilename(firstArchiveEntry.getExtractedFilePath());
       if (header === undefined) {
-        throw new Error(`couldn't get header for: ${archiveEntries[0].getExtractedFilePath()}`);
+        throw new Error(`couldn't get header for: ${firstArchiveEntry.getExtractedFilePath()}`);
       }
-      const archiveEntry = await archiveEntries[0].withFileHeader(header);
+      const archiveEntry = await firstArchiveEntry.withFileHeader(header);
 
       expect(archiveEntry.getCrc32()).toBeDefined();
       expect(archiveEntry.getCrc32WithoutHeader()).toBeDefined();
@@ -824,6 +912,28 @@ describe('copyToTempFile', () => {
   });
 });
 
+describe('extractToIOFile', () => {
+  it('should read archived files from a temp file and remove it after', async () => {
+    const archivePath = path.join('test', 'fixtures', 'roms', 'zip', 'fourfive.zip');
+    const archiveEntries = await new Zip(archivePath).getArchiveEntries(ChecksumBitmask.CRC32);
+    expect(archiveEntries.length).toBeGreaterThan(0);
+
+    for (const archiveEntry of archiveEntries) {
+      const result = await archiveEntry.extractToIOFile(async (ioFile) => ({
+        pathLike: ioFile.getPathLike().toString(),
+        crc32: zlib
+          .crc32(await ioFile.readAt(0, ioFile.getSize()))
+          .toString(16)
+          .padStart(8, '0'),
+      }));
+
+      expect(result.crc32).toEqual(archiveEntry.getCrc32());
+      expect(result.pathLike).not.toEqual(archivePath);
+      await expect(FsUtil.exists(result.pathLike)).resolves.toEqual(false);
+    }
+  });
+});
+
 // Note: this will only return valid archives with at least one file
 const scannedFiles = await new ROMScanner(
   new Options({
@@ -839,17 +949,62 @@ const scannedFiles = await new ROMScanner(
 ).scan();
 const archiveEntries = scannedFiles.filter((entry) => entry instanceof ArchiveEntry);
 
-describe('createReadStream', () => {
+describe('extractToStream', () => {
   test.each(
     archiveEntries
       // Some CHDs can't/shouldn't be extracted, ignore those
-      .filter((file) => !(file.getArchive() instanceof Chd) || file.getSize() > 0)
+      .filter((file) => !(file.getArchive() instanceof Chd) || (file.getSize() ?? 0) > 0)
       .map((file) => [file.toString(), file]),
   )('should extract archived files: %s', async (_, archiveEntry) => {
-    await archiveEntry.createReadStream(async (readable) => {
+    await archiveEntry.extractToStream(async (readable) => {
       const contents = (await bufferUtil.fromReadable(readable)).toString();
       expect(contents).toBeTruthy();
     });
+  });
+
+  test.each(
+    archiveEntries
+      .filter((file) => (file.getSize() ?? 0) > 0)
+      .map((file) => [file.toString(), file]),
+  )('should read archived files from byte offsets: %s', async (_, archiveEntry) => {
+    const contents = await archiveEntry.extractToStream(
+      async (readable) => await bufferUtil.fromReadable(readable),
+    );
+
+    for (const start of [0, 3, contents.length - 1, contents.length]) {
+      const range = await archiveEntry.extractToStream(
+        async (readable) => await bufferUtil.fromReadable(readable),
+        start,
+      );
+      const expected = contents.subarray(start);
+      expect({ start, length: range.length, equal: range.equals(expected) }).toEqual({
+        start,
+        length: expected.length,
+        equal: true,
+      });
+    }
+  });
+});
+
+describe('readFirstBytes', () => {
+  test.each(
+    archiveEntries
+      .filter((file) => (file.getSize() ?? 0) > 0)
+      .map((file) => [file.toString(), file]),
+  )('should read the leading bytes of archived files: %s', async (_, archiveEntry) => {
+    const contents = await archiveEntry.extractToStream(
+      async (readable) => await bufferUtil.fromReadable(readable),
+    );
+
+    for (const byteCount of [1, 16, contents.length, contents.length + 100]) {
+      const firstBytes = await archiveEntry.readFirstBytes(byteCount);
+      const expected = contents.subarray(0, byteCount);
+      expect({ byteCount, length: firstBytes.length, equal: firstBytes.equals(expected) }).toEqual({
+        byteCount,
+        length: expected.length,
+        equal: true,
+      });
+    }
   });
 });
 
@@ -924,5 +1079,19 @@ describe('equals', () => {
     expect(second.equals(third)).toEqual(false);
     expect(third.equals(fourth)).toEqual(false);
     expect(fourth.equals(first)).toEqual(false);
+  });
+
+  it('should not equal the same entry with a different patch', async () => {
+    const entry = await ArchiveEntry.entryOf({
+      archive: new Zip('file.zip'),
+      entryPath: 'entry.rom',
+      size: 0,
+      crc32: '00000000',
+    });
+    const patchedEntry = entry.withPatch(
+      IPSPatch.patchFrom(await File.fileOf({ filePath: 'patch 00000000.ips' })),
+    );
+    expect(entry.equals(patchedEntry)).toEqual(false);
+    expect(patchedEntry.equals(entry)).toEqual(false);
   });
 });

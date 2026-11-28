@@ -1,7 +1,85 @@
 import ROM from '../../src/models/dats/rom.js';
+import ArchiveEntry from '../../src/models/files/archives/archiveEntry.js';
+import Zip from '../../src/models/files/archives/zip.js';
 import File from '../../src/models/files/file.js';
-import ROMHeader from '../../src/models/files/romHeader.js';
+import FileSignature from '../../src/models/files/fileSignature.js';
 import IndexedFiles from '../../src/models/indexedFiles.js';
+import PathUtil from '../../src/utils/pathUtil.js';
+
+describe('fromFiles', () => {
+  const filePromises = ['bravo', 'alpha', 'charlie'].map(
+    async (filePath) =>
+      await File.fileOf({
+        filePath,
+        size: 1,
+        crc32: '11111111',
+        sha1: '1111111111111111111111111111111111111111',
+      }),
+  );
+
+  it('should sort found files by location without a comparator', async () => {
+    const indexedFiles = IndexedFiles.fromFiles(await Promise.all(filePromises));
+    expect(
+      indexedFiles
+        .findFiles(new ROM({ name: '', size: 1, crc32: '11111111' }))
+        .map((file) => file.getFilePath()),
+    ).toEqual(['alpha', 'bravo', 'charlie'].map((filePath) => PathUtil.resolve(filePath)));
+  });
+
+  it('should sort found files with the comparator', async () => {
+    const indexedFiles = IndexedFiles.fromFiles(
+      await Promise.all(filePromises),
+      (fileOne, fileTwo) => fileTwo.getFilePath().localeCompare(fileOne.getFilePath()),
+    );
+    const expected = ['charlie', 'bravo', 'alpha'].map((filePath) => PathUtil.resolve(filePath));
+    expect(
+      indexedFiles
+        .findFiles(new ROM({ name: '', size: 1, crc32: '11111111' }))
+        .map((file) => file.getFilePath()),
+    ).toEqual(expected);
+    expect(
+      indexedFiles
+        .findFiles(new ROM({ name: '', size: 1, sha1: '1111111111111111111111111111111111111111' }))
+        .map((file) => file.getFilePath()),
+    ).toEqual(expected);
+  });
+});
+
+describe('getFiles', () => {
+  it('should sort files sharing a checksum', async () => {
+    const files = await Promise.all([
+      ...['bravo', 'alpha', 'charlie'].map(
+        async (filePath) => await File.fileOf({ filePath, size: 1, crc32: '11111111' }),
+      ),
+      ...['delta', 'echo'].map(
+        async (filePath) =>
+          await File.fileOf({
+            filePath,
+            size: 2,
+            crc32: '22222222',
+            sha1: '2222222222222222222222222222222222222222',
+          }),
+      ),
+    ]);
+
+    expect(
+      IndexedFiles.fromFiles(files)
+        .getFiles()
+        .map((file) => file.getFilePath()),
+    ).toEqual(
+      ['alpha', 'bravo', 'charlie', 'delta', 'echo'].map((filePath) => PathUtil.resolve(filePath)),
+    );
+    expect(
+      IndexedFiles.fromFiles(files, (fileOne, fileTwo) =>
+        fileTwo.getFilePath().localeCompare(fileOne.getFilePath()),
+      )
+        .getFiles()
+        .map((file) => file.getFilePath()),
+    ).toEqual(
+      ['charlie', 'bravo', 'alpha', 'echo', 'delta'].map((filePath) => PathUtil.resolve(filePath)),
+    );
+  });
+});
 
 describe('findFiles', () => {
   const filePromises = [
@@ -15,7 +93,7 @@ describe('findFiles', () => {
       size: 2,
       crc32: '22222222',
       md5: '22222222222222222222222222222222',
-      fileHeader: ROMHeader.headerFromFilename('two.lnx'),
+      fileHeader: FileSignature.romHeaderFromFilename('two.lnx'),
     }),
     File.fileOf({
       filePath: 'three',
@@ -38,7 +116,7 @@ describe('findFiles', () => {
       size: 6,
       sha1: '6666666666666666666666666666666666666666',
       sha256: '6666666666666666666666666666666666666666666666666666666666666666',
-      fileHeader: ROMHeader.headerFromFilename('six.nes'),
+      fileHeader: FileSignature.romHeaderFromFilename('six.nes'),
     }),
     File.fileOf({
       filePath: 'seven',
@@ -127,6 +205,31 @@ describe('findFiles', () => {
     ).toHaveLength(1);
   });
 
+  it('should deduplicate separate file objects at the same location', async () => {
+    const indexedFiles = IndexedFiles.fromFiles(
+      await Promise.all([
+        File.fileOf({ filePath: 'one', size: 1, crc32: '11111111' }),
+        File.fileOf({ filePath: 'one', size: 1, crc32: '11111111' }),
+        ArchiveEntry.entryOf({
+          archive: new Zip('two.zip'),
+          entryPath: 'two.bin',
+          size: 1,
+          crc32: '11111111',
+        }),
+        ArchiveEntry.entryOf({
+          archive: new Zip('two.zip'),
+          entryPath: 'two.bin',
+          size: 1,
+          crc32: '11111111',
+        }),
+      ]),
+    );
+    const rom = new ROM({ name: '', size: 1, crc32: '11111111' });
+    expect(indexedFiles.findFiles(rom)).toHaveLength(2);
+    expect(indexedFiles.findFilesAtPath(rom, PathUtil.resolve('two.zip'))).toHaveLength(1);
+    expect(indexedFiles.getSize()).toEqual(2);
+  });
+
   it('should return all files when checksums match different files', async () => {
     const indexedFiles = IndexedFiles.fromFiles(await Promise.all(filePromises));
     // sha256 matches 'seven', sha1 matches 'five' — both distinct files should be returned
@@ -171,5 +274,171 @@ describe('findFiles', () => {
         }),
       ),
     ).toHaveLength(0);
+  });
+
+  describe('files matched by different checksums', () => {
+    const preferArchiveEntries = (fileOne: File, fileTwo: File): number =>
+      (fileOne instanceof ArchiveEntry ? 0 : 1) - (fileTwo instanceof ArchiveEntry ? 0 : 1);
+    const rom = new ROM({
+      name: '',
+      size: 1,
+      crc32: '11111111',
+      sha1: '1111111111111111111111111111111111111111',
+    });
+
+    it('should prefer files matched by stronger checksums without a comparator', async () => {
+      const plainFile = await File.fileOf({
+        filePath: 'plain.rom',
+        size: 1,
+        crc32: '11111111',
+        sha1: '1111111111111111111111111111111111111111',
+      });
+      const archiveEntry = await ArchiveEntry.entryOf({
+        archive: new Zip('archive.zip'),
+        entryPath: 'archive.rom',
+        size: 1,
+        crc32: '11111111',
+      });
+      const indexedFiles = IndexedFiles.fromFiles([archiveEntry, plainFile]);
+      expect(indexedFiles.findFiles(rom)).toEqual([plainFile, archiveEntry]);
+    });
+
+    it('should sort files matched by different checksums with the comparator', async () => {
+      const plainFile = await File.fileOf({
+        filePath: 'plain.rom',
+        size: 1,
+        crc32: '11111111',
+        sha1: '1111111111111111111111111111111111111111',
+      });
+      const archiveEntry = await ArchiveEntry.entryOf({
+        archive: new Zip('archive.zip'),
+        entryPath: 'archive.rom',
+        size: 1,
+        crc32: '11111111',
+      });
+      const indexedFiles = IndexedFiles.fromFiles([plainFile, archiveEntry], preferArchiveEntries);
+      expect(indexedFiles.findFiles(rom)).toEqual([archiveEntry, plainFile]);
+    });
+
+    it('should prefer files matched by stronger checksums when the comparator ties', async () => {
+      const plainFile = await File.fileOf({
+        filePath: 'plain.rom',
+        size: 1,
+        crc32: '11111111',
+      });
+      const strongerPlainFile = await File.fileOf({
+        filePath: 'stronger.rom',
+        size: 1,
+        crc32: '11111111',
+        sha1: '1111111111111111111111111111111111111111',
+      });
+      const indexedFiles = IndexedFiles.fromFiles([plainFile, strongerPlainFile], () => 0);
+      expect(indexedFiles.findFiles(rom)).toEqual([strongerPlainFile, plainFile]);
+    });
+
+    it('should sort files that all matched the same checksums with the comparator', async () => {
+      const fullyHashedFile = async (filePath: string): Promise<File> =>
+        await File.fileOf({
+          filePath,
+          size: 1,
+          crc32: '11111111',
+          sha1: '1111111111111111111111111111111111111111',
+        });
+      const alpha = await fullyHashedFile('alpha.rom');
+      const bravo = await fullyHashedFile('bravo.rom');
+      const charlie = await fullyHashedFile('charlie.rom');
+      const indexedFiles = IndexedFiles.fromFiles([bravo, alpha, charlie], (fileOne, fileTwo) =>
+        fileTwo.getFilePath().localeCompare(fileOne.getFilePath()),
+      );
+      expect(indexedFiles.findFiles(rom)).toEqual([charlie, bravo, alpha]);
+      expect(indexedFiles.findFilesAtPath(rom, bravo.getFilePath())).toEqual([bravo]);
+    });
+
+    it('should rank files by the strongest checksum they matched', async () => {
+      const romWithMd5 = new ROM({
+        name: '',
+        size: 1,
+        crc32: '11111111',
+        md5: '11111111111111111111111111111111',
+        sha1: '1111111111111111111111111111111111111111',
+      });
+      const crc32File = await File.fileOf({
+        filePath: 'alpha.rom',
+        size: 1,
+        crc32: '11111111',
+      });
+      const md5File = await File.fileOf({
+        filePath: 'bravo.rom',
+        size: 1,
+        crc32: '11111111',
+        md5: '11111111111111111111111111111111',
+      });
+      const sha1File = await File.fileOf({
+        filePath: 'charlie.rom',
+        size: 1,
+        crc32: '11111111',
+        sha1: '1111111111111111111111111111111111111111',
+      });
+      const indexedFiles = IndexedFiles.fromFiles([crc32File, md5File, sha1File]);
+      expect(indexedFiles.findFiles(romWithMd5)).toEqual([sha1File, md5File, crc32File]);
+      expect(indexedFiles.findFilesAtPath(romWithMd5, md5File.getFilePath())).toEqual([md5File]);
+    });
+  });
+});
+
+describe('findFilesAtPath', () => {
+  it('should find what findFiles finds, at one path', async () => {
+    // Several files share each checksum, as identical tracks do across many discs
+    const files = await Promise.all([
+      ...['alpha.zip', 'bravo.zip', 'charlie.zip'].flatMap((filePath) => [
+        File.fileOf({ filePath, size: 1, crc32: '11111111' }),
+        File.fileOf({
+          filePath,
+          size: 2,
+          crc32: '22222222',
+          md5: '22222222222222222222222222222222',
+        }),
+        File.fileOf({ filePath, size: 3, sha1: '3333333333333333333333333333333333333333' }),
+      ]),
+      // A single file at its path, like an extracted file or a single-file archive
+      File.fileOf({ filePath: 'echo.zip', size: 1, crc32: '11111111' }),
+      // Several entries in one archive sharing a checksum, as identical tracks do within one disc
+      ...['one.bin', 'two.bin', 'three.bin'].map(
+        async (entryPath) =>
+          await ArchiveEntry.entryOf({
+            archive: new Zip('foxtrot.zip'),
+            entryPath,
+            size: 1,
+            crc32: '11111111',
+          }),
+      ),
+      ArchiveEntry.entryOf({
+        archive: new Zip('foxtrot.zip'),
+        entryPath: 'four.bin',
+        size: 3,
+        sha1: '3333333333333333333333333333333333333333',
+      }),
+    ]);
+    const indexedFiles = IndexedFiles.fromFiles(files);
+
+    for (const rom of [
+      new ROM({ name: 'one', size: 1, crc32: '11111111' }),
+      new ROM({ name: 'two', size: 2, crc32: '22222222', md5: '22222222222222222222222222222222' }),
+      new ROM({ name: 'three', size: 3, sha1: '3333333333333333333333333333333333333333' }),
+      new ROM({ name: 'none', size: 9, crc32: '99999999' }),
+    ]) {
+      for (const filePath of [
+        'alpha.zip',
+        'bravo.zip',
+        'charlie.zip',
+        'delta.zip',
+        'echo.zip',
+        'foxtrot.zip',
+      ]) {
+        expect(indexedFiles.findFilesAtPath(rom, filePath)).toEqual(
+          indexedFiles.findFiles(rom).filter((file) => file.getFilePath() === filePath),
+        );
+      }
+    }
   });
 });

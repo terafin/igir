@@ -1,5 +1,6 @@
 import os from 'node:os';
 
+import CandidateWriterSemaphore from '../../src/async/candidateWriterSemaphore.js';
 import MappableSemaphore from '../../src/async/mappableSemaphore.js';
 import FileCache from '../../src/cache/fileCache.js';
 import FileFactory from '../../src/factories/fileFactory.js';
@@ -61,6 +62,7 @@ async function runFixdatCreator(
   const fixdatPath = await new FixdatCreator(
     new Options(optionsProps),
     new ProgressBarFake(),
+    new CandidateWriterSemaphore(os.availableParallelism()),
   ).create(dat, candidates);
   if (!fixdatPath) {
     return undefined;
@@ -79,7 +81,7 @@ async function runFixdatCreator(
         new FileFactory(new FileCache()),
         new MappableSemaphore(os.availableParallelism()),
       ).scan()
-    )[0];
+    ).at(0);
   } finally {
     await FsUtil.rm(fixdatPath, { force: true });
   }
@@ -118,7 +120,7 @@ it('should write some ROMs if some ROMs are missing', async () => {
   expect(fixdat).toBeDefined();
   const games = fixdat?.getGames() ?? [];
   expect(games).toHaveLength(1);
-  expect(games[0].getName()).toEqual(gameWithOneRom.getName());
+  expect(games.at(0)?.getName()).toEqual(gameWithOneRom.getName());
 });
 
 it('should write all ROMs if all ROMs are missing', async () => {
@@ -132,6 +134,6 @@ it('should write all ROMs if all ROMs are missing', async () => {
   expect(fixdat).toBeDefined();
   const games = fixdat?.getGames() ?? [];
   expect(games).toHaveLength(2);
-  expect(games[0].getName()).toEqual(gameWithOneRom.getName());
-  expect(games[1].getName()).toEqual(gameWithTwoRoms.getName());
+  expect(games.at(0)?.getName()).toEqual(gameWithOneRom.getName());
+  expect(games.at(1)?.getName()).toEqual(gameWithTwoRoms.getName());
 });

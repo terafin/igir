@@ -6,6 +6,7 @@ import path from 'node:path';
 import { Expose, instanceToPlain, plainToInstance } from 'class-transformer';
 import fg from 'fast-glob';
 import micromatch from 'micromatch';
+import { Memoize } from 'typescript-memoize';
 
 import { LogLevel, LogLevelValue } from '../console/logLevel.js';
 import IgirException from '../exceptions/igirException.js';
@@ -13,10 +14,10 @@ import Temp from '../globals/temp.js';
 import ArrayUtil from '../utils/arrayUtil.js';
 import DateUtil from '../utils/dateUtil.js';
 import FsUtil, { FsWalkCallback, WalkMode, WalkModeValue } from '../utils/fsUtil.js';
+import PathUtil from '../utils/pathUtil.js';
 import URLUtil from '../utils/urlUtil.js';
 import Disk from './dats/disk.js';
 import ROM from './dats/rom.js';
-import File from './files/file.js';
 import {
   ChecksumBitmask,
   ChecksumBitmaskKey,
@@ -553,7 +554,7 @@ export default class Options implements OptionsProps {
     );
     this.patchOnly = options?.patchOnly ?? false;
 
-    this.output = options?.output === undefined ? undefined : path.resolve(options.output);
+    this.output = options?.output === undefined ? undefined : PathUtil.resolve(options.output);
     this.dirMirror = options?.dirMirror ?? false;
     this.dirDatMirror = options?.dirDatMirror ?? false;
     this.dirDatName = options?.dirDatName ?? false;
@@ -576,7 +577,7 @@ export default class Options implements OptionsProps {
       filePath.replaceAll(/[\\/]/g, path.sep),
     );
     this.cleanBackup =
-      options?.cleanBackup === undefined ? undefined : path.resolve(options.cleanBackup);
+      options?.cleanBackup === undefined ? undefined : PathUtil.resolve(options.cleanBackup);
     this.cleanDryRun = options?.cleanDryRun ?? false;
 
     this.zipFormat = options?.zipFormat;
@@ -651,18 +652,18 @@ export default class Options implements OptionsProps {
     this.playlistExtensions = options?.playlistExtensions ?? [];
 
     this.dir2datOutput =
-      options?.dir2datOutput === undefined ? undefined : path.resolve(options.dir2datOutput);
+      options?.dir2datOutput === undefined ? undefined : PathUtil.resolve(options.dir2datOutput);
 
     this.fixdatOutput =
-      options?.fixdatOutput === undefined ? undefined : path.resolve(options.fixdatOutput);
+      options?.fixdatOutput === undefined ? undefined : PathUtil.resolve(options.fixdatOutput);
 
-    this.reportOutput = path.resolve(options?.reportOutput ?? process.cwd());
+    this.reportOutput = PathUtil.resolve(options?.reportOutput ?? process.cwd());
 
     this.datThreads = Math.max(options?.datThreads ?? 0, 1);
     this.readerThreads = Math.max(options?.readerThreads ?? 0, 1);
     this.writerThreads = Math.max(options?.writerThreads ?? 0, 1);
 
-    this.tempDir = path.resolve(options?.tempDir ?? Temp.getTempDir());
+    this.tempDir = PathUtil.resolve(options?.tempDir ?? Temp.getTempDir());
     this.disableCache = options?.disableCache ?? false;
     this.cachePath = options?.cachePath;
 
@@ -705,9 +706,9 @@ export default class Options implements OptionsProps {
       .split(/\r?\n/)
       .filter((line) => line.length > 0)
       .map((line) => {
-        const flagsMatch = /^\/(.+)\/([a-z]*)$/.exec(line);
-        if (flagsMatch !== null) {
-          return new RegExp(flagsMatch[1], flagsMatch[2]);
+        const [, source, flags] = /^\/(.+)\/([a-z]*)$/.exec(line) ?? [];
+        if (source !== undefined) {
+          return new RegExp(source, flags);
         }
         return new RegExp(line);
       });
@@ -715,6 +716,7 @@ export default class Options implements OptionsProps {
 
   // Commands
 
+  @Memoize()
   getCommands(): Set<string> {
     return new Set(this.commands.map((c) => c.toLowerCase()));
   }
@@ -922,7 +924,7 @@ export default class Options implements OptionsProps {
 
     // Glob the contents of directories
     if (await FsUtil.isDirectory(inputPath)) {
-      return (await FsUtil.walk(inputPath, walkMode, walkCallback)).map((p) => path.resolve(p));
+      return (await FsUtil.walk(inputPath, walkMode, walkCallback)).map((p) => PathUtil.resolve(p));
     }
 
     // If the file exists, don't process it as a glob pattern
@@ -930,7 +932,7 @@ export default class Options implements OptionsProps {
       if (walkCallback !== undefined) {
         walkCallback(1);
       }
-      return [path.resolve(inputPath)];
+      return [PathUtil.resolve(inputPath)];
     }
 
     // Try to handle globs a little more intelligently (see the JSDoc below)
@@ -962,7 +964,7 @@ export default class Options implements OptionsProps {
     if (walkCallback !== undefined) {
       walkCallback(globbedPaths.length);
     }
-    return globbedPaths.map((globbedPath) => path.resolve(globbedPath));
+    return globbedPaths.map((globbedPath) => PathUtil.resolve(globbedPath));
   }
 
   /**
@@ -1097,13 +1099,20 @@ export default class Options implements OptionsProps {
   }
 
   /**
+   * Was an output directory explicitly provided?
+   */
+  hasOutput(): boolean {
+    return this.output !== undefined;
+  }
+
+  /**
    * Get the "root" sub-path of the output dir, the sub-path up until the first replaceable token.
    */
   getOutputDirRoot(): string {
-    const resolvedOutput = path.resolve(this.getOutput());
+    const resolvedOutput = PathUtil.resolve(this.getOutput());
     const outputSplit = resolvedOutput.split(path.sep);
-    for (let i = 0; i < outputSplit.length; i += 1) {
-      if (/{[a-zA-Z]+}/.test(outputSplit[i])) {
+    for (const [i, outputSegment] of outputSplit.entries()) {
+      if (/{[a-zA-Z]+}/.test(outputSegment)) {
         return outputSplit.slice(0, i).join(path.sep) || path.sep;
       }
     }
@@ -1165,6 +1174,17 @@ export default class Options implements OptionsProps {
     return FixExtension[fixExtensionMode as FixExtensionKey];
   }
 
+  /**
+   * Should output file extensions be corrected, given the "--fix-extension" mode and whether
+   * there's a more trustworthy source of filenames (DATs, or input files when generating a dir2dat)?
+   */
+  shouldFixExtension(): boolean {
+    return (
+      this.getFixExtension() === FixExtension.ALWAYS ||
+      (this.getFixExtension() === FixExtension.AUTO && !this.shouldDir2Dat() && !this.usingDats())
+    );
+  }
+
   getOverwrite(): boolean {
     return this.overwrite;
   }
@@ -1196,11 +1216,11 @@ export default class Options implements OptionsProps {
    */
   async scanOutputFilesWithoutCleanExclusions(
     outputDirs: string[],
-    writtenFiles: File[],
+    writtenFilePaths: string[],
     walkCallback?: FsWalkCallback,
   ): Promise<string[]> {
     // Written files that shouldn't be cleaned
-    const writtenFilesNormalized = new Set(writtenFiles.map((file) => file.getFilePath()));
+    const writtenFilesNormalized = new Set(writtenFilePaths);
 
     // Files excluded from cleaning
     const cleanExcludedFilesNormalized = new Set(await this.scanCleanExcludeFiles());
@@ -1301,7 +1321,7 @@ export default class Options implements OptionsProps {
       // Option wasn't provided, we shouldn't remove headers
       return false;
     }
-    if (this.removeHeaders.length === 1 && this.removeHeaders[0] === '') {
+    if (this.removeHeaders.length === 1 && this.removeHeaders.at(0) === '') {
       // Option was provided without any extensions, we should remove headers from every file
       return true;
     }

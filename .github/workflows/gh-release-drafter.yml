@@ -33,7 +33,7 @@ jobs:
       version: ${{ steps.check.outputs.version }}
       release_id: ${{ steps.release-drafter.outputs.id }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ env.ref }}
@@ -72,7 +72,7 @@ jobs:
       # Create/update the draft release
       - if: steps.check.outputs.changed == 'true'
         id: release-drafter
-        uses: release-drafter/release-drafter@ed4bc48ec97379be2258e7b7ac2624a3e26ab809 # v7.4.0
+        uses: release-drafter/release-drafter@d1a19e60e81a7e650d00a7de9277f87e439117ea # v7.11.0
         with:
           name: v${{ steps.check.outputs.version }}
           tag: v${{ steps.check.outputs.version }}
@@ -81,10 +81,9 @@ jobs:
           # NOTE(cemmer): `template` can't be supplied here, only `header` and `footer`, so have to pick one of those
           #   and make sure the .github/gh-release-drafter.yml's `template` is empty-ish.
           header: ${{ steps.auto-changelog.outputs.MARKDOWN }}
-        env:
           # NOTE(cemmer): PAT here causes the release to be made under your account.
           #   ${{ secrets.GITHUB_TOKEN }} would cause it to be created from `github-actions`, even when published.
-          GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
       - if: ${{ steps.release-drafter.outputs.id }}
         run: |
           {

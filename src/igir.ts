@@ -5,7 +5,7 @@ import async from 'async';
 import chalk from 'chalk';
 import isAdmin from 'is-admin';
 
-import { CHDType } from '../packages/chdman/index.js';
+import { CHDType } from '../addons/chdman/index.js';
 import CandidateWriterSemaphore from './async/candidateWriterSemaphore.js';
 import FileMoveMutex from './async/fileMoveMutex.js';
 import MappableSemaphore from './async/mappableSemaphore.js';
@@ -23,7 +23,7 @@ import type DAT from './models/dats/dat.js';
 import type DATStatus from './models/datStatus.js';
 import ArchiveEntry from './models/files/archives/archiveEntry.js';
 import Chd from './models/files/archives/chd/chd.js';
-import File from './models/files/file.js';
+import type File from './models/files/file.js';
 import { ChecksumBitmask, ChecksumBitmaskInverted } from './models/files/fileChecksums.js';
 import type IndexedFiles from './models/indexedFiles.js';
 import Options, { InputChecksumArchivesMode, LinkMode } from './models/options.js';
@@ -37,7 +37,6 @@ import CandidateMergeSplitValidator from './modules/candidates/candidateMergeSpl
 import CandidatePatchGenerator from './modules/candidates/candidatePatchGenerator.js';
 import CandidatePostProcessor from './modules/candidates/candidatePostProcessor.js';
 import CandidateValidator from './modules/candidates/candidateValidator.js';
-import type { CandidateWriterResults } from './modules/candidates/candidateWriter.js';
 import CandidateWriter from './modules/candidates/candidateWriter.js';
 import OutputFactory from './modules/candidates/utils/outputFactory.js';
 import DirectoryCleaner from './modules/cleaners/directoryCleaner.js';
@@ -64,6 +63,7 @@ import StatusGenerator from './modules/statusGenerator.js';
 import ArrayUtil from './utils/arrayUtil.js';
 import FsUtil from './utils/fsUtil.js';
 import IntlUtil from './utils/intlUtil.js';
+import PathUtil from './utils/pathUtil.js';
 
 /**
  * The main class that coordinates file scanning, processing, and writing.
@@ -118,15 +118,15 @@ export default class Igir {
       fileCache.disable();
     } else {
       const cachePath = await this.getCachePath();
-      if (cachePath !== undefined && process.env.NODE_ENV !== 'test') {
+      if (cachePath === undefined || process.env.NODE_ENV === 'test') {
+        logger.trace('not using a file for the file cache');
+      } else {
         if (await FsUtil.exists(cachePath)) {
           logger.trace(`loading the existing file cache at '${cachePath}'`);
         } else {
           logger.trace(`creating a new file cache at '${cachePath}'`);
         }
         await fileCache.loadFile(cachePath);
-      } else {
-        logger.trace('not using a file for the file cache');
       }
     }
     const fileFactory = new FileFactory(fileCache);
@@ -138,11 +138,13 @@ export default class Igir {
 
     // Scan and process input files
     let dats = await this.processDATScanner(fileFactory, readerSemaphore);
+    const scanningBitmask = this.determineScanningBitmask(dats);
+    this.warnUnmatchableChecksums(dats, scanningBitmask);
     const indexedRoms = await this.processROMScanner(
       dats,
       fileFactory,
       readerSemaphore,
-      this.determineScanningBitmask(dats),
+      scanningBitmask,
       this.determineScanningChecksumArchives(dats),
     );
     const roms = indexedRoms.getFiles();
@@ -156,7 +158,9 @@ export default class Igir {
       progressBarSizeMultiplier: 2,
     });
     if (dats.length === 0) {
-      dats = await new DATGameInferrer(this.options, datProcessProgressBar).infer(roms);
+      dats = await new DATGameInferrer(this.options, datProcessProgressBar, readerSemaphore).infer(
+        roms,
+      );
       datProcessProgressBar.setTotal(dats.length);
     }
     if (dats.length <= 1) {
@@ -164,12 +168,10 @@ export default class Igir {
       datProcessProgressBar.delete();
     }
 
-    const candidateWriterResults: CandidateWriterResults = {
-      wrote: [],
-      moved: [],
-    };
-    const filesToExcludeFromCleaning: File[] = [];
-    let romOutputDirs: string[] = [];
+    const movedCandidates: WriteCandidate[] = [];
+    const writtenOutputFilePaths = new Set<string>();
+    const filePathsToExcludeFromCleaning = new Set<string>();
+    const romOutputDirs = new Set<string>();
     const datsStatuses: DATStatus[] = [];
 
     // Process every DAT
@@ -202,11 +204,13 @@ export default class Igir {
           // Note that only the correct/output path is excluded, not the current/input path. Files
           // that aren't in the correct location will be deleted.
           if (!romWithFiles.getInputFile().getCanBeCandidateInput()) {
-            filesToExcludeFromCleaning.push(romWithFiles.getOutputFile());
+            filePathsToExcludeFromCleaning.add(romWithFiles.getOutputFile().getFilePath());
           }
         }
       }
-      romOutputDirs = [...romOutputDirs, ...this.getCandidateOutputDirs(processedDat, candidates)];
+      for (const outputDir of this.getCandidateOutputDirs(processedDat, candidates)) {
+        romOutputDirs.add(outputDir);
+      }
 
       // Write the output files
       const writerResults = await new CandidateWriter(
@@ -216,36 +220,42 @@ export default class Igir {
         writerSemaphore,
         moveMutex,
       ).write(processedDat, candidates);
-      for (const moved of writerResults.moved) candidateWriterResults.moved.push(moved);
-      for (const wrote of writerResults.wrote) candidateWriterResults.wrote.push(wrote);
+      for (const moved of writerResults.moved) {
+        movedCandidates.push(moved);
+      }
+      for (const wrote of writerResults.wrote) {
+        for (const romWithFiles of wrote.getRomsWithFiles()) {
+          writtenOutputFilePaths.add(romWithFiles.getOutputFile().getFilePath());
+        }
+      }
 
       // Write playlists
-      const playlistPaths = await new PlaylistCreator(this.options, progressBar).write(
-        processedDat,
-        candidates,
-      );
-      await Promise.all(
-        playlistPaths.map(async (filePath) => {
-          filesToExcludeFromCleaning.push(await File.fileOf({ filePath }));
-        }),
-      );
+      const playlistPaths = await new PlaylistCreator(
+        this.options,
+        progressBar,
+        writerSemaphore,
+      ).write(processedDat, candidates);
+      for (const playlistPath of playlistPaths) {
+        filePathsToExcludeFromCleaning.add(PathUtil.resolve(playlistPath));
+      }
 
       // Write a dir2dat
-      const dir2DatPath = await new Dir2DatCreator(this.options, progressBar).create(
-        processedDat,
-        candidates,
-      );
+      const dir2DatPath = await new Dir2DatCreator(
+        this.options,
+        progressBar,
+        writerSemaphore,
+      ).create(processedDat, candidates);
       if (dir2DatPath) {
-        filesToExcludeFromCleaning.push(await File.fileOf({ filePath: dir2DatPath }));
+        filePathsToExcludeFromCleaning.add(PathUtil.resolve(dir2DatPath));
       }
 
       // Write a fixdat
-      const fixdatPath = await new FixdatCreator(this.options, progressBar).create(
+      const fixdatPath = await new FixdatCreator(this.options, progressBar, writerSemaphore).create(
         processedDat,
         candidates,
       );
       if (fixdatPath) {
-        filesToExcludeFromCleaning.push(await File.fileOf({ filePath: fixdatPath }));
+        filePathsToExcludeFromCleaning.add(PathUtil.resolve(fixdatPath));
       }
 
       // Write the output report
@@ -281,23 +291,22 @@ export default class Igir {
     datProcessProgressBar.finishWithItems(dats.length, 'DAT', 'processed');
     datProcessProgressBar.delete();
 
-    const writtenOutputFiles = candidateWriterResults.wrote.flatMap((wc) =>
-      wc.getRomsWithFiles().map((rwf) => rwf.getOutputFile()),
-    );
-
     // Delete moved ROMs
-    await this.deleteMovedRoms(indexedRoms, candidateWriterResults.moved, writtenOutputFiles);
+    await this.deleteMovedRoms(indexedRoms, movedCandidates, [...writtenOutputFilePaths]);
 
     // Clean the output directories
-    const cleanedOutputFiles = await this.processOutputCleaner(romOutputDirs, [
-      // Do not clean output ROMs
-      ...writtenOutputFiles,
-      // Do not clean any other files written (dir2dats, fixdats, playlists, etc.)
-      ...filesToExcludeFromCleaning,
-    ]);
+    const cleanedOutputFiles = await this.processOutputCleaner(
+      [...romOutputDirs],
+      [
+        // Do not clean output ROMs
+        ...writtenOutputFilePaths,
+        // Do not clean any other files written (dir2dats, fixdats, playlists, etc.)
+        ...filePathsToExcludeFromCleaning,
+      ],
+    );
 
     // Generate the report
-    await this.processReportGenerator(roms, cleanedOutputFiles, datsStatuses);
+    await this.processReportGenerator(roms, cleanedOutputFiles, datsStatuses, writerSemaphore);
 
     Timer.cancelAll();
   }
@@ -498,6 +507,40 @@ export default class Igir {
     return matchChecksum;
   }
 
+  /**
+   * Warn about every DAT ROM and disk that has no possibility of matching any
+   * input file, because none of its checksums will be calculated given the
+   * --input-checksum-min and --input-checksum-max options.
+   */
+  private warnUnmatchableChecksums(dats: DAT[], scanningBitmask: number): void {
+    // Unmatchable ROMs have none of the calculated checksums, so they're missing all of them
+    const missingNames = Object.values(ChecksumBitmask)
+      .filter((checksum) => checksum !== ChecksumBitmask.NONE && (scanningBitmask & checksum) !== 0)
+      .map((checksum) => ChecksumBitmaskInverted[checksum])
+      .join(', ');
+
+    for (const dat of dats) {
+      const unmatchableLines = dat
+        .getGames()
+        .flatMap((game) => [
+          ...game.getRoms(),
+          ...(this.options.getExcludeDisks() ? [] : game.getDisks()),
+        ])
+        .filter((rom) => {
+          const romBitmask = rom.getChecksumBitmask();
+          return romBitmask !== ChecksumBitmask.NONE && (romBitmask & scanningBitmask) === 0;
+        })
+        .map((rom) => `  ${rom.getName()} (missing ${missingNames})`);
+      if (unmatchableLines.length === 0) {
+        continue;
+      }
+
+      logger.warn(
+        `${dat.getName()}: ${IntlUtil.toLocaleString(unmatchableLines.length)} ROM${unmatchableLines.length === 1 ? '' : 's'} can't match due to provided checksum restrictions:\n${unmatchableLines.join('\n')}`,
+      );
+    }
+  }
+
   private determineScanningChecksumArchives(dats: DAT[]): boolean {
     if (this.options.getInputChecksumArchives() === InputChecksumArchivesMode.NEVER) {
       return false;
@@ -507,7 +550,9 @@ export default class Igir {
     }
     return dats.some(
       (dat) =>
-        dat.isMame() &&
+        // MAME DATs catalog CHDs (and other files with archive-like extensions) by the checksums
+        // in their headers, not the checksums of their contents
+        !dat.isMame() &&
         dat.getGames().some((game) =>
           game.getRoms().some((rom) => {
             const isArchive = FileFactory.isExtensionArchive(rom.getName());
@@ -541,24 +586,25 @@ export default class Igir {
       readerSemaphore,
     ).scan(checksumBitmask, shouldChecksumArchives);
 
-    if (dats.some((dat) => !dat.isMame())) {
+    if (this.options.getInputChecksumQuick() && dats.some((dat) => !dat.isMame())) {
       const chds = rawRomFiles
         .filter((file) => file instanceof ArchiveEntry)
         .map((file) => file.getArchive())
         .filter((file) => file instanceof Chd);
-      const chdToType = await Promise.all(
-        chds.map(async (chd): Promise<[Chd, CHDType]> => [chd, (await chd.getInfo()).type]),
-      );
-      const cdRom = chdToType.find(([, type]) => type === CHDType.CD_ROM);
-      if (cdRom !== undefined) {
+      const chdToType = await readerSemaphore.map(chds, async (chd): Promise<[Chd, CHDType]> => [
+        chd,
+        (await chd.getInfo()).type,
+      ]);
+      const [cdRomChd] = chdToType.find(([, type]) => type === CHDType.CD_ROM) ?? [];
+      if (cdRomChd !== undefined) {
         logger.warn(
-          `${cdRom[0].getFilePath()}: quick checksumming will not process .cue/.bin files in CD-ROM CHDs!`,
+          `${cdRomChd.getFilePath()}: quick checksumming will not process .cue/.bin files in CD-ROM CHDs!`,
         );
       }
-      const gdRom = chdToType.find(([, type]) => type === CHDType.GD_ROM);
-      if (gdRom !== undefined) {
+      const [gdRomChd] = chdToType.find(([, type]) => type === CHDType.GD_ROM) ?? [];
+      if (gdRomChd !== undefined) {
         logger.warn(
-          `${gdRom[0].getFilePath()}: quick checksumming will not process .gdi/.bin/.raw files in GD-ROM CHDs!`,
+          `${gdRomChd.getFilePath()}: quick checksumming will not process .gdi/.bin/.raw files in GD-ROM CHDs!`,
         );
       }
     }
@@ -730,7 +776,7 @@ export default class Igir {
   private async deleteMovedRoms(
     indexedRoms: IndexedFiles,
     movedWriteCandidates: WriteCandidate[],
-    writtenFilesToExclude: File[],
+    writtenFilePathsToExclude: string[],
   ): Promise<void> {
     if (movedWriteCandidates.length === 0) {
       return;
@@ -741,7 +787,7 @@ export default class Igir {
     const deletedFilePaths = await new MovedROMDeleter(this.options, progressBar).delete(
       indexedRoms,
       movedWriteCandidates,
-      writtenFilesToExclude,
+      writtenFilePathsToExclude,
     );
 
     progressBar.setName('Deleting empty input subdirectories');
@@ -760,17 +806,16 @@ export default class Igir {
 
   private async processOutputCleaner(
     dirsToClean: string[],
-    writtenFilesToExclude: File[],
+    writtenFilePathsToExclude: string[],
   ): Promise<string[]> {
     if (!this.options.shouldWrite() || !this.options.shouldClean() || dirsToClean.length === 0) {
       return [];
     }
 
     const progressBar = this.multiBar.addSingleBar({ name: 'Cleaning output directory' });
-    const uniqueDirsToClean = dirsToClean.reduce(ArrayUtil.reduceUnique(), []);
     const filesCleaned = await new DirectoryCleaner(this.options, progressBar).clean(
-      uniqueDirsToClean,
-      writtenFilesToExclude,
+      dirsToClean,
+      writtenFilePathsToExclude,
     );
     progressBar.finishWithItems(filesCleaned.length, 'file', 'recycled');
     progressBar.freeze();
@@ -781,6 +826,7 @@ export default class Igir {
     scannedRomFiles: File[],
     cleanedOutputFiles: string[],
     datsStatuses: DATStatus[],
+    writerSemaphore: CandidateWriterSemaphore,
   ): Promise<void> {
     if (!this.options.shouldReport()) {
       return;
@@ -790,7 +836,7 @@ export default class Igir {
       name: 'Generating report',
       symbol: ProgressBarSymbol.WRITING,
     });
-    await new ReportGenerator(this.options, reportProgressBar).generate(
+    await new ReportGenerator(this.options, reportProgressBar, writerSemaphore).generate(
       scannedRomFiles,
       cleanedOutputFiles,
       datsStatuses,

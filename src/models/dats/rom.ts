@@ -1,9 +1,11 @@
 import { Expose, Transform } from 'class-transformer';
 
+import IgirException from '../../exceptions/igirException.js';
+import FsUtil from '../../utils/fsUtil.js';
 import Archive from '../files/archives/archive.js';
 import ArchiveEntry from '../files/archives/archiveEntry.js';
 import File from '../files/file.js';
-import { ChecksumProps } from '../files/fileChecksums.js';
+import { ChecksumBitmask, ChecksumProps } from '../files/fileChecksums.js';
 
 type ROMStatus = 'baddump' | 'nodump' | 'good';
 
@@ -12,7 +14,7 @@ export interface ROMProps extends ChecksumProps {
   // @see http://www.logiqx.com/Dats/datafile.dtd
 
   readonly name: string;
-  readonly size: number;
+  readonly size?: number;
   readonly status?: ROMStatus;
   readonly merge?: string;
   readonly bios?: string;
@@ -35,6 +37,12 @@ export interface ROMProps extends ChecksumProps {
  */
 export default class ROM implements ROMProps {
   @Expose()
+  @Transform(({ value }: { value: undefined | string }) => {
+    if (value !== undefined && FsUtil.isPathTraversal(value)) {
+      throw new IgirException(`ROM name is unsafe for directory traversal: ${value}`);
+    }
+    return value;
+  })
   readonly name: string;
 
   @Expose()
@@ -83,6 +91,9 @@ export default class ROM implements ROMProps {
   readonly bios?: string;
 
   constructor(props?: ROMProps) {
+    if (props?.name !== undefined && FsUtil.isPathTraversal(props.name)) {
+      throw new IgirException(`ROM name is unsafe for directory traversal: ${props.name}`);
+    }
     this.name = props?.name ?? '';
     this.size = props?.size ?? 0;
     this.crc32 = props?.crc32?.toLowerCase().replace(/^0x/, '').padStart(8, '0');
@@ -147,6 +158,27 @@ export default class ROM implements ROMProps {
 
   getBios(): string | undefined {
     return this.bios;
+  }
+
+  /**
+   * Get the bitmask of every checksum that can be used to match this {@link ROM} to a file.
+   */
+  getChecksumBitmask(): number {
+    let checksumBitmask: number = ChecksumBitmask.NONE;
+    // Zero-byte ROMs can still match by CRC32, so don't require a non-zero size
+    if (this.getCrc32()) {
+      checksumBitmask |= ChecksumBitmask.CRC32;
+    }
+    if (this.getMd5()) {
+      checksumBitmask |= ChecksumBitmask.MD5;
+    }
+    if (this.getSha1()) {
+      checksumBitmask |= ChecksumBitmask.SHA1;
+    }
+    if (this.getSha256()) {
+      checksumBitmask |= ChecksumBitmask.SHA256;
+    }
+    return checksumBitmask;
   }
 
   /**
